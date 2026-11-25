@@ -3278,7 +3278,7 @@ impl<'a> Lower<'a> {
         // runs it: its LDS accesses in the console wave's lockstep order,
         // with a group sync before and after each (every thread is here:
         // `Lower::split_console`).
-        let lockstep = self.split.is_some() && self.console_mode && is_lds_mem(inst);
+        let lockstep = self.split.is_some() && self.split_console && is_lds_mem(inst);
         if lockstep {
             self.group_sync(self.cur);
         }
@@ -10305,7 +10305,7 @@ impl<'a> Lower<'a> {
                 // half's answer too, so both take the branch alike (every
                 // thread is here: `Lower::split_console`). A missing half
                 // (the group's last lanes) does not count.
-                let cond = if self.split.is_some() && self.console_mode {
+                let cond = if self.split.is_some() && self.split_console {
                     let c = self.cur;
                     let x = self.s.m.cast(c, Cast::ZExt, cond, self.s.t.i32);
                     let (other, exists) = self.other_half(c, x).map_err(|w| unsupported(offset, w))?;

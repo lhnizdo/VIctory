@@ -225,8 +225,11 @@ impl Lower<'_> {
     fn every_thread(&self, block: Option<usize>) -> Result<(), Why> {
         // Run as the console runs it (`Lower::split_console`): both halves
         // take every branch for the whole console wave, so they run the
-        // same blocks the same number of times.
-        if self.console_mode {
+        // same blocks the same number of times. Only for a group of one
+        // console wave: console mode alone (barriers that cannot be
+        // balanced) does not keep other console waves of the group in the
+        // block, and a group sync there waits for them forever.
+        if self.split_console {
             return Ok(());
         }
         let split = self.split.as_ref().expect("a split program");
