@@ -203,6 +203,9 @@ struct Lower<'a> {
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
+    /// Group barriers to emit on a branch edge, by (from, to) IR block
+    /// ([`Lower::barrier_balance`]).
+    extra_barriers: HashMap<(usize, usize), u32>,
     /// Per IR block: a `done` export is behind every lane entering it.
     exported: Vec<bool>,
     /// Reverse-postorder index per IR block.
@@ -609,6 +612,7 @@ impl<'a> Lower<'a> {
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
             edges: HashMap::new(),
+            extra_barriers: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
@@ -1249,6 +1253,12 @@ impl<'a> Lower<'a> {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
         }
+        // A program whose barriers cannot be counted is emitted as before,
+        // unbalanced: refused, it would not run at all (the title's
+        // luminance histograms and shadow classification are among them),
+        // and it only hangs where lanes of a group part at its barriers.
+        // shortcut: such programs (33 of the title's) can still hang.
+        self.extra_barriers = self.barrier_balance(&order).unwrap_or_default();
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
@@ -3266,14 +3276,7 @@ impl<'a> Lower<'a> {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
             Fields::Sopp { .. } if name == "s_barrier" => {
-                // Thread-group sync with a shared-memory fence, and a UAV
-                // fence when the program writes UAVs (the waits before an
-                // s_barrier make those writes visible on the console).
-                let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
-                let mode = self.s.m.i32(mode);
-                let void = self.s.t.void;
-                self.s
-                    .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                self.group_barrier(self.cur);
                 Ok(())
             }
             Fields::Sopp { .. } => Ok(()),
@@ -9509,15 +9512,206 @@ impl<'a> Lower<'a> {
             .iter()
             .filter(|&&q| self.block[q].is_some())
             .count();
+        let extra = self.extra_barriers.get(&(from, to)).copied().unwrap_or(0);
         // Back edges stay as they are: the exiting block is the latch.
-        if preds < 2 || self.rpo[to] <= self.rpo[from] {
+        if (preds < 2 && extra == 0) || self.rpo[to] <= self.rpo[from] {
             return target;
         }
         let e = self.s.m.new_block();
+        // The group barriers lanes taking this edge would miss
+        // ([`Lower::barrier_balance`]).
+        for _ in 0..extra {
+            self.group_barrier(e);
+        }
         self.s.m.terminate(e, Term::Br(target));
         self.edges.insert((from, to), e);
         e
     }
+
+    /// A group barrier (`s_barrier`): thread-group sync with a shared-memory
+    /// fence, and a UAV fence when the program writes UAVs (the waits before
+    /// an s_barrier make those writes visible on the console).
+    fn group_barrier(&mut self, block: usize) {
+        let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
+        let mode = self.s.m.i32(mode);
+        let void = self.s.t.void;
+        self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
+    /// Group barriers per lane-dependent branch edge, so that every lane
+    /// of a group arrives at a barrier the same number of times. The
+    /// console runs `s_barrier` per wave: a branch skips a block only when
+    /// no lane of the wave needs it, and the wave runs the block, barrier
+    /// included, with the other lanes masked off. On the host each lane
+    /// takes its own branch, so lanes skipping a block with a barrier never
+    /// arrive at it and the lanes inside wait for them forever (a GPU hang;
+    /// the title's compute_graph_ops, sky scattering and blendshape
+    /// programs, in hung submissions). A host barrier counts arrivals, not
+    /// instructions, so the lighter side of such a branch gets as many
+    /// barriers as the sides' counts to the program's end differ.
+    ///
+    /// Counts are taken over forward edges, so inside a loop with uniform
+    /// exits they balance each iteration (every lane runs as many).
+    /// Refused: a loop with a barrier and a lane-dependent exit, counts
+    /// that vary along uniform paths inside a lane-dependent branch, and
+    /// indirect jumps, where no count holds. Programs without barriers
+    /// emission keeps get nothing.
+    // shortcut: the extra barriers are at the start of the lighter edge, so
+    // a lane there may read LDS after the join before the heavier side's
+    // last writes before the join show (on the console those lanes are in
+    // lockstep with the others).
+    fn barrier_balance(
+        &self,
+        order: &[usize],
+    ) -> Result<HashMap<(usize, usize), u32>, (usize, Why)> {
+        let p = self.x.p;
+        let st = self.x.st;
+        let barriers = |b: usize| -> u32 {
+            if self.no_barrier.contains(&b) {
+                return 0;
+            }
+            p.blocks[b]
+                .insts
+                .iter()
+                .filter(|i| i.name() == "s_barrier")
+                .count() as u32
+        };
+        let total: u32 = order.iter().map(|&b| barriers(b)).sum();
+        let mut extra = HashMap::new();
+        if total == 0 {
+            return Ok(extra);
+        }
+        let offset = |b: usize| {
+            p.blocks[b]
+                .insts
+                .last()
+                .map_or(p.blocks[b].offset, |i| i.machine.offset)
+        };
+        let lane = |when: Bool| {
+            when != Bool::TRUE
+                && when != Bool::FALSE
+                && !st
+                    .bools
+                    .support(when)
+                    .iter()
+                    .all(|a| matches!(a, Atom::Uniform(_)))
+        };
+        let back = |from: usize, to: usize| self.rpo[to] <= self.rpo[from];
+        // Loops: back edge l -> h, the blocks between them in reverse
+        // postorder (an over-approximation), and whether one holds a
+        // barrier. One that does may only be left uniformly.
+        let loops: Vec<(usize, usize, bool)> = order
+            .iter()
+            .flat_map(|&l| {
+                let succ: Vec<usize> = match st.exits[l] {
+                    LaneExit::Jump(t) => vec![t],
+                    LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+                    _ => vec![],
+                };
+                succ.into_iter()
+                    .filter(move |&h| self.block[h].is_some() && back(l, h))
+                    .map(move |h| (h, l))
+                    .collect::<Vec<_>>()
+            })
+            .map(|(h, l)| {
+                let barrier = order.iter().any(|&x| {
+                    self.rpo[h] <= self.rpo[x] && self.rpo[x] <= self.rpo[l] && barriers(x) > 0
+                });
+                (h, l, barrier)
+            })
+            .collect();
+        let inside = |(h, l): (usize, usize), x: usize| self.rpo[h] <= self.rpo[x] && self.rpo[x] <= self.rpo[l];
+        // Whether a per-lane branch leaves a loop (or goes round it): a lane
+        // going on there leaves it later the same way, so its side needs no
+        // count of its own. Err if the loop holds a barrier.
+        let leaves_loop = |b: usize, taken: usize, not_taken: usize| -> Result<Option<usize>, (usize, Why)> {
+            let mut out = None;
+            // Every loop the branch leaves or goes round, not just the first.
+            for &(h, l, barrier) in &loops {
+                let r = (h, l);
+                if !inside(r, b) {
+                    continue;
+                }
+                let (ti, ni) = (inside(r, taken) && !back(b, taken), inside(r, not_taken) && !back(b, not_taken));
+                if ti && ni {
+                    continue;
+                }
+                if barrier {
+                    return Err((offset(b), "a loop with a group barrier left per lane"));
+                }
+                // The side leaving the loop (or not going round it).
+                out = Some(if ti { not_taken } else { taken });
+            }
+            Ok(out)
+        };
+        // Barriers from each block's start to the program's end over
+        // forward edges: the counts possible along uniform paths (every
+        // lane of a group takes the same one), sorted.
+        // shortcut: two sides of a per-lane branch whose sets differ by a
+        // constant are taken to differ by it along every uniform path; a
+        // side with a uniform choice of its own before the join that the
+        // other lacks could pair counts otherwise.
+        const MOST: usize = 16;
+        let shift = |set: &[u32], by: u32| -> Vec<u32> { set.iter().map(|c| c + by).collect() };
+        let mut to_end: HashMap<usize, Vec<u32>> = HashMap::new();
+        for &b in order.iter().rev() {
+            let here = barriers(b);
+            let after = |to: usize| -> Vec<u32> {
+                if self.block[to].is_none() || back(b, to) {
+                    vec![0]
+                } else {
+                    to_end.get(&to).cloned().unwrap_or_else(|| vec![0])
+                }
+            };
+            let count = match st.exits[b] {
+                LaneExit::End => vec![here],
+                LaneExit::Indirect => {
+                    return Err((offset(b), "an indirect jump in a program with group barriers"));
+                }
+                LaneExit::Jump(t) => shift(&after(t), here),
+                LaneExit::Branch { when, taken, not_taken } => {
+                    let (x, y) = (after(taken), after(not_taken));
+                    let out = if lane(when) {
+                        leaves_loop(b, taken, not_taken)?
+                    } else {
+                        None
+                    };
+                    if let Some(out) = out {
+                        shift(&after(out), here)
+                    } else if lane(when) {
+                        // The same counts up to a constant: the lighter side
+                        // gets that many more.
+                        let (lo, hi, light) = if x[0] <= y[0] { (&x, &y, taken) } else { (&y, &x, not_taken) };
+                        let n = hi[0] - lo[0];
+                        if lo.len() != hi.len() || shift(lo, n) != *hi {
+                            return Err((
+                                offset(b),
+                                "group barriers counted differently along uniform paths inside a per-lane branch",
+                            ));
+                        }
+                        if n > 0 {
+                            if back(b, light) {
+                                return Err((offset(b), "a loop with a group barrier left per lane"));
+                            }
+                            extra.insert((b, light), n);
+                        }
+                        shift(hi, here)
+                    } else {
+                        let mut both: Vec<u32> = x.iter().chain(&y).map(|c| c + here).collect();
+                        both.sort_unstable();
+                        both.dedup();
+                        if both.len() > MOST {
+                            return Err((offset(b), "too many uniform paths with group barriers"));
+                        }
+                        both
+                    }
+                }
+            };
+            to_end.insert(b, count);
+        }
+        Ok(extra)
+    }
+
 
     /// Whether no lane entering IR block `b` from its `n`th predecessor
     /// reads what `reg` holds there before something overwrites it. The
