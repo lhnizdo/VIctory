@@ -10,7 +10,112 @@ static MAIN_IMAGE_BASE: AtomicUsize = AtomicUsize::new(0);
 /// `GetModuleHandle(NULL)` and friends to return this, not our own exe.
 pub fn set_main_image(base: usize) {
     MAIN_IMAGE_BASE.store(base, Ordering::Release);
+    if std::env::var_os("VICTORY_POOL_NO_ASSERT").is_some_and(|v| v == "1") {
+        bypass_pool_asserts(base);
+    }
     start_watch(base);
+}
+
+/// Diagnostics, `VICTORY_POOL_NO_ASSERT=1`: the title's lock-free pools
+/// stop the title with `int 3` when their free list is empty (the
+/// `building` and `INSTANCE_LIST` pools fill about ten minutes in, while
+/// its instance culling does not run on hosts of 32-lane waves). Each such
+/// site, `cmp r32, 0x1FFFE` (the empty marker) then `je` to an `int 3`
+/// followed by `xor reg, reg` (the allocator's own null return), gets that
+/// `int 3` made a `nop`: the allocation returns null instead.
+/// shortcut: a caller that does not expect null may fault later; a stopgap
+/// for longer runs, not a fix (issue #698 upstream).
+fn bypass_pool_asserts(base: usize) {
+    // SAFETY: the main image is mapped at `base` with its PE headers; only
+    // its own sections are read, and single bytes of code written with the
+    // page made writable for the write.
+    unsafe {
+        let read32 = |at: usize| (at as *const u32).read_unaligned();
+        let read16 = |at: usize| (at as *const u16).read_unaligned();
+        let nt = base + read32(base + 0x3C) as usize;
+        let sections = read16(nt + 6) as usize;
+        let table = nt + 24 + read16(nt + 20) as usize;
+        let mut sites = Vec::new();
+        for k in 0..sections {
+            let h = table + 40 * k;
+            let (size, rva, flags) = (read32(h + 8) as usize, read32(h + 12) as usize, read32(h + 36));
+            // IMAGE_SCN_MEM_EXECUTE
+            if flags & 0x2000_0000 == 0 {
+                continue;
+            }
+            let code = std::slice::from_raw_parts((base + rva) as *const u8, size);
+            sites.extend(pool_assert_sites(code).into_iter().map(|i| base + rva + i));
+        }
+        use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+        let mut patched = 0;
+        for &at in &sites {
+            let mut old = 0;
+            if VirtualProtect(at as *const _, 1, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
+                (at as *mut u8).write(0x90);
+                VirtualProtect(at as *const _, 1, old, &mut old);
+                patched += 1;
+            }
+        }
+        use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        FlushInstructionCache(GetCurrentProcess(), std::ptr::null(), 0);
+        tracing::warn!(sites = sites.len(), patched, "VICTORY_POOL_NO_ASSERT: pool-empty breakpoints made nops");
+    }
+}
+
+/// Offsets in `code` of `int 3`s a pool allocator jumps to on an empty free
+/// list ([`bypass_pool_asserts`]).
+fn pool_assert_sites(code: &[u8]) -> Vec<usize> {
+    const EMPTY: [u8; 4] = 0x1FFFE_u32.to_le_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 16 < code.len() {
+        // cmp eax, imm32 | cmp r32, imm32 | cmp r8d-r15d, imm32
+        let after = if code[i] == 0x3D && code[i + 1..i + 5] == EMPTY {
+            Some(i + 5)
+        } else if code[i] == 0x81 && (0xF8..=0xFF).contains(&code[i + 1]) && code[i + 2..i + 6] == EMPTY {
+            Some(i + 6)
+        } else if code[i] == 0x41
+            && code[i + 1] == 0x81
+            && (0xF8..=0xFF).contains(&code[i + 2])
+            && code[i + 3..i + 7] == EMPTY
+        {
+            Some(i + 7)
+        } else {
+            None
+        };
+        if let Some(j) = after {
+            let target = match code[j] {
+                0x74 => Some((j + 2) as isize + isize::from(code[j + 1] as i8)),
+                0x0F if code[j + 1] == 0x84 => {
+                    let rel = i32::from_le_bytes([code[j + 2], code[j + 3], code[j + 4], code[j + 5]]);
+                    Some((j + 6) as isize + rel as isize)
+                }
+                _ => None,
+            };
+            if let Some(t) = target.and_then(|t| usize::try_from(t).ok())
+                && t + 4 < code.len()
+                && code[t] == 0xCC
+                && is_xor_self(&code[t + 1..t + 4])
+                && !out.contains(&t)
+            {
+                out.push(t);
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `xor r32, r32` of one register (31 /r or 33 /r, register form, with an
+/// optional REX prefix setting both R and B or neither).
+fn is_xor_self(b: &[u8]) -> bool {
+    let (rex, op, modrm) = match b[0] {
+        0x40..=0x4F => (b[0], b[1], b[2]),
+        _ => (0, b[0], b[1]),
+    };
+    let same_ext = (rex & 4 != 0) == (rex & 1 != 0);
+    (op == 0x31 || op == 0x33) && modrm >> 6 == 3 && (modrm >> 3) & 7 == modrm & 7 && same_ext
 }
 
 /// Diagnostics: `VICTORY_WATCH=<rva>:<offset>,<offset>...` (hex) logs every
