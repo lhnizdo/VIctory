@@ -48,12 +48,61 @@ fn start_watch(base: usize) {
                         object.map_or("?".into(), |p| format!("{p:#x}")),
                         fields.join(" ")
                     );
+                    if let Some(pool) = object {
+                        dump_pool_slot(base, pool as usize);
+                    }
                 }
             });
         if let Err(e) = spawned {
             tracing::warn!(error = %e, "VICTORY_WATCH: no watcher thread");
         }
     });
+}
+
+/// Diagnostics, with `VICTORY_WATCH_DUMP=<qwords>`: the title pool at
+/// `pool` (slots at `[pool]`, slot size at `[pool+8]`, next free slot in
+/// the low 17 bits of `[pool+0x20]`) has its newest slot logged, qword by
+/// qword: one pointing into the main image as `img+rva` (a vtable, a
+/// global), one pointing at an object whose first qword does as
+/// `obj(vt img+rva)`, so the types of what a leaking object refers to show.
+fn dump_pool_slot(base: usize, pool: usize) {
+    static QWORDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let qwords = *QWORDS.get_or_init(|| {
+        std::env::var("VICTORY_WATCH_DUMP").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    });
+    if qwords == 0 {
+        return;
+    }
+    let (Some(slots), Some(size), Some(head)) =
+        (read_u64(pool), read_u64(pool + 8), read_u64(pool + 0x20))
+    else {
+        return;
+    };
+    let (size, next) = (size as u32 as usize, (head & 0x1FFFF) as usize);
+    if size == 0 || next == 0 || next >= 0x1FFFE {
+        return;
+    }
+    // Image span: the main image is about 0xB070000 bytes.
+    let image = |v: u64| (v as usize).checked_sub(base).filter(|&r| r < 0xB07_0000);
+    let at = slots as usize + (next - 1) * size;
+    let words: Vec<String> = (0..qwords.min(size / 8))
+        .map(|k| match read_u64(at + 8 * k) {
+            None => "?".into(),
+            Some(v) => match image(v) {
+                Some(r) => format!("img+{r:#x}"),
+                None => match read_u64(v as usize).and_then(image) {
+                    Some(r) => format!("obj(vt img+{r:#x})"),
+                    None => format!("{v:#x}"),
+                },
+            },
+        })
+        .collect();
+    tracing::info!(
+        target: "victory_hle::watch",
+        "pool slot {} ({size} bytes) at {at:#x}: {}",
+        next - 1,
+        words.join(" ")
+    );
 }
 
 /// A qword of our own process's memory at `at`, if mapped and readable.
