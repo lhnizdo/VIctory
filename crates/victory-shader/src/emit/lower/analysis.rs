@@ -165,9 +165,16 @@ impl<'a> Lower<'a> {
                 continue;
             };
             let when = st.whens[b].unwrap_or(when);
+            // In a console wave split in two (`Lower::split_console`), a
+            // scalar condition can differ between the halves too: SCC of a
+            // lane mask (`s_andn2_b64 s, s, exec` ending a loop while any
+            // lane is left) sees each half's own lanes. Every branch is
+            // decided for the console wave there; a truly uniform one
+            // gives both halves the same answer anyway.
             let lane = when != Bool::TRUE
                 && when != Bool::FALSE
-                && !st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_)));
+                && (self.split_console
+                    || !st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))));
             if !lane {
                 continue;
             }
