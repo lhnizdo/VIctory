@@ -13,7 +13,139 @@ pub fn set_main_image(base: usize) {
     if std::env::var_os("VICTORY_POOL_NO_ASSERT").is_some_and(|v| v == "1") {
         bypass_pool_asserts(base);
     }
+    if let Some(factor) = std::env::var("VICTORY_POOL_SCALE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&f| f > 1)
+    {
+        scale_pools(base, factor);
+    }
     start_watch(base);
+}
+
+/// The config lookup pools are sized by (`(table, count, name hash,
+/// default) -> value`) and the pool initialiser (`(pool, slots, slot
+/// bytes)`), as RVAs of image `b99f876b74d4a77f` (title 1.0.2.1).
+const POOL_SIZE_LOOKUP: usize = 0x50C_EF40;
+const POOL_INIT: usize = 0x16C_BE00;
+/// The `building` pool's creation, checked before patching anything: its
+/// first bytes, and its call of the lookup at +0x20.
+const BUILDING_POOL_AT: usize = 0x5AD_8E40;
+const BUILDING_POOL_BYTES: [u8; 9] = [0x56, 0x57, 0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x05];
+
+/// The pool slot limit: slot indices are 17 bits, `0x1FFFE` the empty mark.
+const POOL_MOST: u32 = 0x1_FFF0;
+
+static POOL_BASE: AtomicUsize = AtomicUsize::new(0);
+static POOL_FACTOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+static POOLS_SCALED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// What the title's pool creations call instead of the size lookup
+/// ([`scale_pools`]): the title's own lookup, times the factor.
+extern "win64" fn scaled_pool_size(table: u64, count: u32, hash: u32, default: u32) -> u32 {
+    let base = POOL_BASE.load(Ordering::Relaxed);
+    // SAFETY: the title's own lookup at its RVA in the mapped image (checked
+    // in `scale_pools`), called with the arguments it was called with.
+    let lookup: extern "win64" fn(u64, u32, u32, u32) -> u32 =
+        unsafe { std::mem::transmute(base + POOL_SIZE_LOOKUP) };
+    let size = lookup(table, count, hash, default);
+    POOLS_SCALED.fetch_add(1, Ordering::Relaxed);
+    let factor = POOL_FACTOR.load(Ordering::Relaxed);
+    if size >= POOL_MOST { size } else { size.saturating_mul(factor).min(POOL_MOST) }
+}
+
+/// Diagnostics, `VICTORY_POOL_SCALE=<factor>`: every title pool is made
+/// `factor` times larger (at most [`POOL_MOST`] slots). The title's
+/// `building` and `INSTANCE_LIST` pools fill about ten minutes in while its
+/// instance culling does not run on hosts of 32-lane waves (upstream issue
+/// #698); larger pools take longer to fill. Each call of the size lookup
+/// followed within 0x60 bytes by a call of the pool initialiser is pointed
+/// at [`scaled_pool_size`] through a jump next to the image (a call reaches
+/// 2 GiB). Only for the image these RVAs were read from: anything else is
+/// left alone.
+/// shortcut: a stopgap; the leak goes on, with more room (more memory).
+fn scale_pools(base: usize, factor: u32) {
+    // SAFETY: the main image is mapped at `base` with its PE headers; its
+    // sections are read, and the call sites' rel32 written with the page
+    // made writable for the write. The jump is our own allocation.
+    unsafe {
+        let at = std::slice::from_raw_parts((base + BUILDING_POOL_AT) as *const u8, 0x30);
+        let call = |o: usize| {
+            (at[o] == 0xE8).then(|| {
+                let rel = i32::from_le_bytes([at[o + 1], at[o + 2], at[o + 3], at[o + 4]]);
+                (base + BUILDING_POOL_AT + o + 5).wrapping_add(rel as isize as usize)
+            })
+        };
+        if at[..9] != BUILDING_POOL_BYTES || call(0x20) != Some(base + POOL_SIZE_LOOKUP) {
+            tracing::warn!("VICTORY_POOL_SCALE: not the image it knows; pools left alone");
+            return;
+        }
+        let read32 = |at: usize| (at as *const u32).read_unaligned();
+        let read16 = |at: usize| (at as *const u16).read_unaligned();
+        let nt = base + read32(base + 0x3C) as usize;
+        let image_size = read32(nt + 24 + 56) as usize;
+        let sections = read16(nt + 6) as usize;
+        let table = nt + 24 + read16(nt + 20) as usize;
+        let mut sites = Vec::new();
+        for k in 0..sections {
+            let h = table + 40 * k;
+            let (size, rva, flags) = (read32(h + 8) as usize, read32(h + 12) as usize, read32(h + 36));
+            if flags & 0x2000_0000 == 0 {
+                continue;
+            }
+            let code = std::slice::from_raw_parts((base + rva) as *const u8, size);
+            let target = |i: usize| {
+                let rel = i32::from_le_bytes([code[i + 1], code[i + 2], code[i + 3], code[i + 4]]);
+                (base + rva + i + 5).wrapping_add(rel as isize as usize)
+            };
+            for i in 0..size.saturating_sub(0x70) {
+                if code[i] == 0xE8
+                    && target(i) == base + POOL_SIZE_LOOKUP
+                    && (i + 5..i + 0x60).any(|j| code[j] == 0xE8 && target(j) == base + POOL_INIT)
+                {
+                    sites.push(base + rva + i);
+                }
+            }
+        }
+        // A jump within reach of every call site: just past the image.
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualAlloc,
+            VirtualProtect,
+        };
+        let mut jump = std::ptr::null_mut();
+        for k in 1..64usize {
+            let want = (base + image_size + k * 0x1_0000) & !0xFFFF;
+            jump = VirtualAlloc(want as *const _, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if !jump.is_null() {
+                break;
+            }
+        }
+        if jump.is_null() {
+            tracing::warn!("VICTORY_POOL_SCALE: no memory near the image for the jump; pools left alone");
+            return;
+        }
+        // jmp [rip+0]; dq scaled_pool_size
+        let stub: [u8; 6] = [0xFF, 0x25, 0, 0, 0, 0];
+        std::ptr::copy_nonoverlapping(stub.as_ptr(), jump.cast::<u8>(), 6);
+        (jump.cast::<u8>().add(6) as *mut u64).write_unaligned(scaled_pool_size as *const () as usize as u64);
+        let mut old = 0;
+        VirtualProtect(jump, 0x1000, PAGE_EXECUTE_READ, &mut old);
+        POOL_BASE.store(base, Ordering::Relaxed);
+        POOL_FACTOR.store(factor, Ordering::Relaxed);
+        let mut patched = 0;
+        for &site in &sites {
+            let rel = (jump as isize - (site as isize + 5)) as i32;
+            if VirtualProtect((site + 1) as *const _, 4, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
+                ((site + 1) as *mut i32).write_unaligned(rel);
+                VirtualProtect((site + 1) as *const _, 4, old, &mut old);
+                patched += 1;
+            }
+        }
+        use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        FlushInstructionCache(GetCurrentProcess(), std::ptr::null(), 0);
+        tracing::warn!(factor, sites = sites.len(), patched, "VICTORY_POOL_SCALE: title pools made larger");
+    }
 }
 
 /// Diagnostics, `VICTORY_POOL_NO_ASSERT=1`: the title's lock-free pools
