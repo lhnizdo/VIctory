@@ -450,6 +450,14 @@ pub struct Structured {
     /// enough (lanes outside EXEC then never get there, so a VGPR write
     /// needs no old value). Always `None` for scalar instructions.
     pub guards: Vec<Vec<Option<Bool>>>,
+    /// Per block and instruction: EXEC where a vector instruction reads it,
+    /// whatever path a lane took there (none: every lane, or a scalar
+    /// instruction). The guards of a program run as the console runs it,
+    /// every lane down every path the wave takes.
+    pub execs: Vec<Vec<Option<Bool>>>,
+    /// Per block ending in a branch on a lane mask: the lane's condition
+    /// for taking it, whatever path the lane took there.
+    pub whens: Vec<Option<Bool>>,
     /// Per block: what holds in every lane that enters it (over forward
     /// edges; a loop header forgets what its loop redefines).
     pub reach: Vec<Bool>,
@@ -853,6 +861,26 @@ impl<'a> Lanes<'a> {
                     .collect()
             })
             .collect();
+        let raw_execs = blocks
+            .iter()
+            .enumerate()
+            .map(|(n, block)| {
+                block
+                    .insts
+                    .iter()
+                    .zip(&execs[n])
+                    .map(|(inst, exec)| match (exec, &inst.fields) {
+                        (None, _)
+                        | (_, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }) => {
+                            None
+                        }
+                        (&Some(e), _) if e == Bool::TRUE => None,
+                        (&Some(e), _) => Some(e),
+                    })
+                    .collect()
+            })
+            .collect();
+        let whens = self.when.clone();
         let exits = blocks
             .iter()
             .enumerate()
@@ -891,6 +919,8 @@ impl<'a> Lanes<'a> {
             exits,
             guards,
             reach: cond.to_vec(),
+            execs: raw_execs,
+            whens,
         })
     }
 
