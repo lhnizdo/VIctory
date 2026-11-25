@@ -2,7 +2,10 @@
 //! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
 //! Compute shaders keep the console's thread-group size; one that depends
 //! on the lane layout (cross-lane operations) declares the console's wave
-//! size (`WaveSize`), so the host device must support it.
+//! size (`WaveSize`), so the host device must support it; on a host without
+//! 64-lane waves ([`set_host_wave64`]) a wave64 program runs each console
+//! wave as two host waves of 32 lanes instead, exchanging values between
+//! them through group-shared memory where it can (`lower::wave64`).
 //!
 //! What the host binds for a translated shader ([`HostShader`]):
 //!
@@ -231,6 +234,8 @@ mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
 mod wave;
+#[cfg(all(test, windows))]
+mod wave64_tests;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -246,6 +251,23 @@ pub use shader::{
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
+
+static HOST_WAVE64: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Tells the translation whether the host runs compute shaders in 64-lane
+/// waves (D3D12 `WaveLaneCountMax` of 64 or more; AMD's do, NVIDIA's run
+/// 32). Without, a wave64 compute program that needs the console's lanes
+/// is split into host waves of 32 lanes, or refused where that cannot be
+/// exact. Set it before translating; the value is part of the translation,
+/// so a cache of translations must key on it. Default: 64-lane waves.
+pub fn set_host_wave64(supported: bool) {
+    HOST_WAVE64.store(supported, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What [`set_host_wave64`] last set.
+pub fn host_wave64() -> bool {
+    HOST_WAVE64.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// The iteration count after which a translated loop is left, per lane and
 /// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].

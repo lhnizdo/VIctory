@@ -88,12 +88,22 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     // The translation depends on it (a view index clamped below a capped
     // heap's end), and so does the cache key.
     crate::descriptor::host::probe_view_limit();
+    // The host device first: it tells the translation its wave sizes.
+    let _ = crate::host::host();
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
     let options = victory_shader::emit::Options { view_marks: true };
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => {
+            // Translations for hosts without 64-lane waves differ.
+            let key = if victory_shader::emit::host_wave64() {
+                *build()
+            } else {
+                *blake3::hash(&[&build()[..], b"wave32"].concat()).as_bytes()
+            };
+            cached(cache, &key, container, translate)
+        }
         None => (translate(container), false),
     }
 }
