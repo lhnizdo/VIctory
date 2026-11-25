@@ -1257,7 +1257,7 @@ impl<'a> Lower<'a> {
         // unbalanced: refused, it would not run at all (the title's
         // luminance histograms and shadow classification are among them),
         // and it only hangs where lanes of a group part at its barriers.
-        // shortcut: such programs (33 of the title's) can still hang.
+        // shortcut: such programs (28 of the title's) can still hang.
         self.extra_barriers = self.barrier_balance(&order).unwrap_or_default();
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
@@ -9683,6 +9683,20 @@ impl<'a> Lower<'a> {
                         // gets that many more.
                         let (lo, hi, light) = if x[0] <= y[0] { (&x, &y, taken) } else { (&y, &x, not_taken) };
                         let n = hi[0] - lo[0];
+                        // A side meeting no more barriers on any path goes
+                        // on to its end and exits; a host barrier does not
+                        // wait for threads that exited (an early return
+                        // before a barrier, which the title's meshlet
+                        // culling does per lane, works on the host too).
+                        // shortcut: D3D12 leaves barriers after a thread's
+                        // exit undefined; NVIDIA and AMD count exited
+                        // threads out.
+                        if lo[..] == [0] && (lo.len() != hi.len() || shift(lo, n) != *hi) {
+                            let mut both = shift(hi, here);
+                            both.dedup();
+                            to_end.insert(b, both);
+                            continue;
+                        }
                         if lo.len() != hi.len() || shift(lo, n) != *hi {
                             return Err((
                                 offset(b),
