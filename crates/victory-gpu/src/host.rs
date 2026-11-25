@@ -3075,8 +3075,8 @@ impl Meter {
         }
     }
 
-    /// Counts a presented frame.
-    fn frame(&mut self, hwnd: HWND) {
+    /// Counts presented frame `number` (as `VICTORY_CAPTURE_FRAMES` counts).
+    fn frame(&mut self, hwnd: HWND, number: u64) {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
@@ -3187,7 +3187,13 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        // The frame number (as captures count frames), and per frame the
+        // draws run and those dropped: without a host pipeline, and
+        // indirect ones the host could not prepare.
+        let text = format!(
+            " | VIctory frame {number} | {fps:.1} fps {ms:.0} ms/frame | {draws:.0} draws, \
+             dropped {dropped:.0} + {indirect:.0} indirect"
+        );
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -3516,7 +3522,7 @@ impl Host {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
-            p.meter.frame(p.hwnd);
+            p.meter.frame(p.hwnd, frame);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]
