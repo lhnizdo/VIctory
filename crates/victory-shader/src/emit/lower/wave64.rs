@@ -47,7 +47,12 @@ use crate::structure::LaneExit;
 /// Group-shared memory a D3D12 compute shader may declare, in dwords.
 const HOST_LDS_DWORDS: u32 = 32 * 1024 / 4;
 
-const NOT_EVERY_THREAD: Why = "a wave64 cross-lane operation spanning both halves, on a host \
+/// Refusal of a group of one console wave that shares LDS without
+/// barriers (the console's wave runs its lanes in lockstep).
+pub(super) const LDS_LOCKSTEP: Why = "LDS shared without barriers by a wave64 group of 33 to 64 threads, on a host \
+     without 64-lane waves";
+
+pub(super) const NOT_EVERY_THREAD: Why = "a wave64 cross-lane operation spanning both halves, on a host \
      without 64-lane waves, where not every thread of the group arrives once";
 
 /// shortcut: a 16-bit whole-wave sum (`Op::AddH`, `wave::Shape::Half`) is
@@ -80,7 +85,14 @@ impl Split {
 /// For a compute program that declares 64-lane waves, on a host without
 /// them: the host wave size it declares instead, and the split, or why it
 /// cannot run there.
-pub(super) fn plan(s: &mut Shader, x: &Parts, console_lanes: bool) -> (Option<Split>, Option<Why>) {
+/// `one_wave_retry`: the group of one console wave is lowered as the
+/// console runs it (`Lower::split_console`), its LDS accesses synced.
+pub(super) fn plan(
+    s: &mut Shader,
+    x: &Parts,
+    console_lanes: bool,
+    one_wave_retry: bool,
+) -> (Option<Split>, Option<Why>) {
     let threads: u32 = s.threads.expect("compute").iter().product();
     if threads <= 32 {
         // One host wave of 32 holds the whole group, as lanes 0-31 of the
@@ -89,14 +101,8 @@ pub(super) fn plan(s: &mut Shader, x: &Parts, console_lanes: bool) -> (Option<Sp
         s.wave_size = Some(32);
         return (None, None);
     }
-    if s.lds_dwords > 0 && threads <= 64 {
-        return (
-            None,
-            Some(
-                "LDS shared without barriers by a wave64 group of 33 to 64 threads, on a host \
-                 without 64-lane waves",
-            ),
-        );
+    if s.lds_dwords > 0 && threads <= 64 && !one_wave_retry {
+        return (None, Some(LDS_LOCKSTEP));
     }
     if !console_lanes {
         // (A wave size is declared only for console lanes or the case above.)
@@ -217,6 +223,12 @@ impl Lower<'_> {
     /// Fails unless every thread of the group runs IR block `block` once
     /// (none: the entry block, before block 0).
     fn every_thread(&self, block: Option<usize>) -> Result<(), Why> {
+        // Run as the console runs it (`Lower::split_console`): both halves
+        // take every branch for the whole console wave, so they run the
+        // same blocks the same number of times.
+        if self.console_mode {
+            return Ok(());
+        }
         let split = self.split.as_ref().expect("a split program");
         match block {
             Some(b) if !split.uniform[b] => Err(NOT_EVERY_THREAD),
@@ -242,7 +254,7 @@ impl Lower<'_> {
     }
 
     /// Thread-group sync with a shared-memory fence, in block `at`.
-    fn group_sync(&mut self, at: usize) {
+    pub(super) fn group_sync(&mut self, at: usize) {
         let mode = self.s.m.i32(1 | 8);
         let void = self.s.t.void;
         self.s
@@ -272,7 +284,7 @@ impl Lower<'_> {
     /// `x`, the same in every lane of this half, as the other half has it,
     /// and whether the other half exists (the group's last console wave
     /// may lack its second half).
-    fn other_half(&mut self, at: usize, x: V) -> Result<(V, V), Why> {
+    pub(super) fn other_half(&mut self, at: usize, x: V) -> Result<(V, V), Why> {
         let (half, base) = self.split_ids();
         let k32 = self.s.m.i32(32);
         let other = self.s.m.bin(at, Bin::Xor, half, k32);
