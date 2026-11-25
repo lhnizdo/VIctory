@@ -21,6 +21,46 @@ pub fn set_main_image(base: usize) {
         scale_pools(base, factor);
     }
     start_watch(base);
+    start_pool_caption(base);
+}
+
+/// The title pools that run dry (`VICTORY_POOL_SCALE`), by the RVA of the
+/// global holding each, with a short name for the caption.
+const CAPTION_POOLS: [(&str, usize); 3] = [("building", 0xA9E_C938), ("instances", 0x8FE_1078), ("nodes", 0x8FE_1088)];
+
+/// Diagnostics: the window caption shows the pools in [`CAPTION_POOLS`] as
+/// used/capacity, once a second (a pool keeps its capacity at +0xC and its
+/// live count at +0x10, both u32). Only for the image those RVAs were read
+/// from ([`BUILDING_POOL_BYTES`]); `VICTORY_POOL_CAPTION=0` turns it off.
+fn start_pool_caption(base: usize) {
+    if std::env::var_os("VICTORY_POOL_CAPTION").is_some_and(|v| v == "0") {
+        return;
+    }
+    // SAFETY: the main image is mapped at `base`; its code is read.
+    let known = unsafe {
+        std::slice::from_raw_parts((base + BUILDING_POOL_AT) as *const u8, BUILDING_POOL_BYTES.len())
+            == BUILDING_POOL_BYTES
+    };
+    if !known {
+        return;
+    }
+    let read32 = |at: usize| read_u64(at).map(|v| v as u32);
+    let _ = std::thread::Builder::new().name("victory pool caption".into()).spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let parts: Vec<String> = CAPTION_POOLS
+                .iter()
+                .filter_map(|&(name, rva)| {
+                    let pool = read_u64(base + rva).filter(|&p| p != 0)? as usize;
+                    let (cap, live) = (read32(pool + 0xC)?, read32(pool + 0x10)?);
+                    (cap > 0).then(|| format!("{name} {live}/{cap}"))
+                })
+                .collect();
+            if !parts.is_empty() {
+                victory_gpu::set_caption_extra(format!("pools {}", parts.join(", ")));
+            }
+        }
+    });
 }
 
 /// The config lookup pools are sized by (`(table, count, name hash,

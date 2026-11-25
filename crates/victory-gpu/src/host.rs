@@ -98,6 +98,16 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
 static ON_FAILURE: OnceLock<fn(&str) -> !> = OnceLock::new();
 
 /// Sets what a host GPU failure does (the runtime's crash report).
+/// Text the window caption shows after the frame statistics (diagnostics
+/// from elsewhere, such as the title's pool use).
+static CAPTION_EXTRA: Mutex<String> = Mutex::new(String::new());
+
+/// Sets the text the window caption shows after its frame statistics;
+/// empty shows nothing more.
+pub fn set_caption_extra(text: String) {
+    *CAPTION_EXTRA.lock().unwrap_or_else(|e| e.into_inner()) = text;
+}
+
 pub fn on_failure(report: fn(&str) -> !) {
     let _ = ON_FAILURE.set(report);
 }
@@ -3190,9 +3200,11 @@ impl Meter {
         // The frame number (as captures count frames), and per frame the
         // draws run and those dropped: without a host pipeline, and
         // indirect ones the host could not prepare.
+        let extra = CAPTION_EXTRA.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let text = format!(
             " | VIctory frame {number} | {fps:.1} fps {ms:.0} ms/frame | {draws:.0} draws, \
-             dropped {dropped:.0} + {indirect:.0} indirect"
+             dropped {dropped:.0} + {indirect:.0} indirect{}{extra}",
+            if extra.is_empty() { "" } else { " | " }
         );
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
