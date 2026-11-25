@@ -3070,6 +3070,9 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    /// When the meter was made (with the host's first presents), for the
+    /// caption's running time.
+    started: std::time::Instant,
 }
 
 impl Meter {
@@ -3082,6 +3085,7 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            started: now,
         }
     }
 
@@ -3201,8 +3205,11 @@ impl Meter {
         // draws run and those dropped: without a host pipeline, and
         // indirect ones the host could not prepare.
         let extra = CAPTION_EXTRA.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        // Running time since the first present (about the launch).
+        let up = self.started.elapsed().as_secs();
+        let (h, m, s) = (up / 3600, up / 60 % 60, up % 60);
         let text = format!(
-            " | VIctory frame {number} | {fps:.1} fps {ms:.0} ms/frame | {draws:.0} draws, \
+            " | VIctory {h}:{m:02}:{s:02} frame {number} | {fps:.1} fps {ms:.0} ms/frame | {draws:.0} draws, \
              dropped {dropped:.0} + {indirect:.0} indirect{}{extra}",
             if extra.is_empty() { "" } else { " | " }
         );
