@@ -42,9 +42,10 @@ static POOLS_SCALED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32
 
 /// The pools [`scale_pools`] makes larger, by config name hash: `building`
 /// (joaat), and `0x0BA88904`, the other pool that runs dry (192-byte
-/// slots; the title's crash report names `INSTANCE_LIST`). Making every
+/// slots; the title's crash report names `INSTANCE_LIST`), and `0xC12C9884`,
+/// the 16-byte list nodes those are linked through, next to fill. Making every
 /// pool larger runs the title out of its memory arena at start.
-const POOLS_TO_SCALE: [u32; 2] = [0x5411_E15C, 0x0BA8_8904];
+const POOLS_TO_SCALE: [u32; 3] = [0x5411_E15C, 0x0BA8_8904, 0xC12C_9884];
 static POOL_HASHES: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
 
 /// What the title's pool creations call instead of the size lookup
