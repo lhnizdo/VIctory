@@ -16,6 +16,22 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
+// The D3D12 Agility SDK: Windows loads the D3D12 runtime from `.\D3D12\`
+// next to the exe (D3D12Core.dll from the Microsoft.Direct3D.D3D12 1.620.x
+// NuGet package) instead of the one in System32, so shader model 6.6
+// dynamic resources work whatever the Windows build. Exported by build.rs.
+// Without that folder Windows falls back to its own runtime.
+
+/// The Agility SDK version in `.\D3D12\` (the middle part of 1.620.x).
+#[unsafe(no_mangle)]
+#[allow(non_upper_case_globals)] // the names Windows looks for
+pub static D3D12SDKVersion: u32 = 620;
+
+/// Where the Agility SDK runtime is, relative to the exe (NUL-terminated).
+#[unsafe(no_mangle)]
+#[allow(non_upper_case_globals)] // the names Windows looks for
+pub static D3D12SDKPath: &[u8; 9] = b".\\D3D12\\\0";
+
 #[derive(Parser)]
 #[command(
     name = "victory",

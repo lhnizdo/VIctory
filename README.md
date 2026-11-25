@@ -181,6 +181,24 @@ Windows SDK's `bin/<version>/x64/dxil.dll`, then falls back to the DLL search
 path when no SDK copy is found. This is a test/offline-validation dependency;
 the translated shaders do not require it at runtime.
 
+### Windows 10: the D3D12 Agility SDK
+
+Windows 10's own D3D12 runtime refuses the root signatures translated
+shaders need (directly indexed descriptor heaps), so nothing draws. On such
+a machine, `victory.exe` can load a newer runtime from a `D3D12` folder next
+to it:
+
+1. Download the [Microsoft.Direct3D.D3D12](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12)
+   NuGet package, version 1.620.x (a `.nupkg` is a zip file).
+2. Copy `D3D12Core.dll` from its `build\native\bin\x64\` into
+   `target\<profile>\D3D12\` (for example `target\release\D3D12\`), and
+   `d3d12SDKLayers.dll` as well for `VICTORY_D3D12_DEBUG=1`.
+
+The SDK version `victory.exe` asks for (`D3D12SDKVersion` in
+`apps/victory/src/main.rs`, 620) must match the DLL's middle number. Without
+the folder Windows keeps its own runtime, which is what Windows 11 needs. The
+exports are made for MSVC builds only; other targets warn while building.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
