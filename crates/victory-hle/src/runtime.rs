@@ -40,8 +40,16 @@ static POOL_BASE: AtomicUsize = AtomicUsize::new(0);
 static POOL_FACTOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 static POOLS_SCALED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// The pools [`scale_pools`] makes larger, by config name hash: `building`
+/// (joaat), and `0x0BA88904`, the other pool that runs dry (192-byte
+/// slots; the title's crash report names `INSTANCE_LIST`). Making every
+/// pool larger runs the title out of its memory arena at start.
+const POOLS_TO_SCALE: [u32; 2] = [0x5411_E15C, 0x0BA8_8904];
+static POOL_HASHES: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+
 /// What the title's pool creations call instead of the size lookup
-/// ([`scale_pools`]): the title's own lookup, times the factor.
+/// ([`scale_pools`]): the title's own lookup, times the factor for the
+/// pools chosen.
 extern "win64" fn scaled_pool_size(table: u64, count: u32, hash: u32, default: u32) -> u32 {
     let base = POOL_BASE.load(Ordering::Relaxed);
     // SAFETY: the title's own lookup at its RVA in the mapped image (checked
@@ -49,12 +57,16 @@ extern "win64" fn scaled_pool_size(table: u64, count: u32, hash: u32, default: u
     let lookup: extern "win64" fn(u64, u32, u32, u32) -> u32 =
         unsafe { std::mem::transmute(base + POOL_SIZE_LOOKUP) };
     let size = lookup(table, count, hash, default);
+    if !POOL_HASHES.get().is_some_and(|h| h.contains(&hash)) {
+        return size;
+    }
     POOLS_SCALED.fetch_add(1, Ordering::Relaxed);
     let factor = POOL_FACTOR.load(Ordering::Relaxed);
     if size >= POOL_MOST { size } else { size.saturating_mul(factor).min(POOL_MOST) }
 }
 
-/// Diagnostics, `VICTORY_POOL_SCALE=<factor>`: every title pool is made
+/// Diagnostics, `VICTORY_POOL_SCALE=<factor>`: the title pools in
+/// [`POOLS_TO_SCALE`] (or `VICTORY_POOL_SCALE_HASHES=<hex>,...`) are made
 /// `factor` times larger (at most [`POOL_MOST`] slots). The title's
 /// `building` and `INSTANCE_LIST` pools fill about ten minutes in while its
 /// instance culling does not run on hosts of 32-lane waves (upstream issue
@@ -132,6 +144,11 @@ fn scale_pools(base: usize, factor: u32) {
         VirtualProtect(jump, 0x1000, PAGE_EXECUTE_READ, &mut old);
         POOL_BASE.store(base, Ordering::Relaxed);
         POOL_FACTOR.store(factor, Ordering::Relaxed);
+        let hashes = std::env::var("VICTORY_POOL_SCALE_HASHES")
+            .ok()
+            .map(|v| v.split(',').filter_map(|h| u32::from_str_radix(h.trim().trim_start_matches("0x"), 16).ok()).collect())
+            .unwrap_or_else(|| POOLS_TO_SCALE.to_vec());
+        let _ = POOL_HASHES.set(hashes);
         let mut patched = 0;
         for &site in &sites {
             let rel = (jump as isize - (site as isize + 5)) as i32;
@@ -144,7 +161,7 @@ fn scale_pools(base: usize, factor: u32) {
         use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         FlushInstructionCache(GetCurrentProcess(), std::ptr::null(), 0);
-        tracing::warn!(factor, sites = sites.len(), patched, "VICTORY_POOL_SCALE: title pools made larger");
+        tracing::warn!(factor, sites = sites.len(), patched, hashes = ?POOL_HASHES.get(), "VICTORY_POOL_SCALE: pool sizes hooked");
     }
 }
 
