@@ -10,6 +10,70 @@ static MAIN_IMAGE_BASE: AtomicUsize = AtomicUsize::new(0);
 /// `GetModuleHandle(NULL)` and friends to return this, not our own exe.
 pub fn set_main_image(base: usize) {
     MAIN_IMAGE_BASE.store(base, Ordering::Release);
+    start_watch(base);
+}
+
+/// Diagnostics: `VICTORY_WATCH=<rva>:<offset>,<offset>...` (hex) logs every
+/// 5 s the qwords at those offsets of the object a pointer at `rva` of the
+/// main image points to, such as a title pool's counters and free-list head.
+/// Reads go through `ReadProcessMemory`: an address that is not mapped
+/// logs `?`.
+fn start_watch(base: usize) {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let Ok(spec) = std::env::var("VICTORY_WATCH") else { return };
+    let hex = |s: &str| usize::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+    let Some((rva, offsets)) = spec.split_once(':') else {
+        tracing::warn!(spec, "VICTORY_WATCH: expected <rva>:<offset>,...");
+        return;
+    };
+    let Some(rva) = hex(rva) else { return };
+    let offsets: Vec<usize> = offsets.split(',').filter_map(hex).collect();
+    STARTED.call_once(|| {
+        let spawned = std::thread::Builder::new()
+            .name("victory watch".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    let object = read_u64(base + rva);
+                    let fields: Vec<String> = offsets
+                        .iter()
+                        .map(|&o| match object.and_then(|p| read_u64(p as usize + o)) {
+                            Some(v) => format!("+{o:#x}={v:#x}"),
+                            None => format!("+{o:#x}=?"),
+                        })
+                        .collect();
+                    tracing::info!(
+                        target: "victory_hle::watch",
+                        "watch image+{rva:#x} -> {}: {}",
+                        object.map_or("?".into(), |p| format!("{p:#x}")),
+                        fields.join(" ")
+                    );
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "VICTORY_WATCH: no watcher thread");
+        }
+    });
+}
+
+/// A qword of our own process's memory at `at`, if mapped and readable.
+fn read_u64(at: usize) -> Option<u64> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut value = 0u64;
+    let mut read = 0usize;
+    // SAFETY: reads into a local of the size given; the process handle is
+    // the current-process pseudo handle.
+    let ok = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            at as *const core::ffi::c_void,
+            (&raw mut value).cast(),
+            8,
+            &mut read,
+        )
+    };
+    (ok != 0 && read == 8).then_some(value)
 }
 
 pub fn main_image() -> Option<usize> {
