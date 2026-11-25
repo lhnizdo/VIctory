@@ -1302,6 +1302,31 @@ fn buffer_srv(
         once!(first, count, element, "buffer view empty or past its host copy");
         return None;
     }
+    let stride = u64::from(buffer.StructureByteStride);
+    if stride > 0 && raw_structured() {
+        // The same bytes as a raw view: the byte offset of a scalar or
+        // offset-only read (`victory_shader::emit`, raw handles) then reads
+        // what it names; through the structured view NVIDIA took it as the
+        // element, so the wind simulation's loop counts were other records'
+        // data and its loops ran until the device was reset. Shaders reading
+        // by element keep their structured handle, which NVIDIA reads on a
+        // raw view as the console would (as `WARP` does; AMD reads element 0,
+        // so only hosts that read it right do this). Raw views start on 16
+        // bytes; one that would not stays structured.
+        let (byte, dwords) = (first * stride, u64::from(count) * stride / 4);
+        match u32::try_from(dwords) {
+            Ok(dwords) if byte.is_multiple_of(16) && stride.is_multiple_of(4) => {
+                desc.Format = DXGI_FORMAT_R32_TYPELESS;
+                desc.Anonymous.Buffer = D3D12_BUFFER_SRV {
+                    FirstElement: byte / 4,
+                    NumElements: dwords,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                };
+            }
+            _ => once!(byte, stride, "structured buffer view not made raw: not on 16 bytes"),
+        }
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -1309,6 +1334,22 @@ fn buffer_srv(
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
     Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
+}
+
+/// Whether structured buffer views are made raw ([`buffer_srv`]): on NVIDIA
+/// hosts, which read a structured handle on a raw view right.
+/// `VICTORY_RAW_STRUCTURED=0` or `=1` decides instead.
+fn raw_structured() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = match std::env::var("VICTORY_RAW_STRUCTURED").as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => crate::host::host_vendor() == 0x10DE,
+        };
+        tracing::info!(on, "structured buffer views made raw");
+        on
+    })
 }
 
 /// Whether `count` elements of `element` bytes from element `first` lie in

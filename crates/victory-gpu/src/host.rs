@@ -283,6 +283,25 @@ fn process_memory() -> (u64, u64) {
     (c.PagefileUsage as u64, c.WorkingSetSize as u64)
 }
 
+/// The PCI vendor id of the host device's adapter (NVIDIA 0x10DE), 0 if it
+/// cannot be told.
+pub(crate) fn host_vendor() -> u32 {
+    static VENDOR: OnceLock<u32> = OnceLock::new();
+    *VENDOR.get_or_init(|| {
+        let Some(host) = host() else { return 0 };
+        // SAFETY: plain DXGI queries for the device's own adapter.
+        let vendor = unsafe {
+            let luid = host.device.GetAdapterLuid();
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(luid))
+                .and_then(|a| a.GetDesc1())
+                .map_or(0, |d| d.VendorId)
+        };
+        tracing::info!(vendor = format_args!("{vendor:#x}"), "host adapter vendor");
+        vendor
+    })
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
