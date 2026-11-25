@@ -3073,6 +3073,10 @@ struct Meter {
     /// When the meter was made (with the host's first presents), for the
     /// caption's running time.
     started: std::time::Instant,
+    /// Per frame over the last report: draws dropped without a host
+    /// pipeline, and indirect ones the host could not prepare (the caption
+    /// shows them between reports).
+    last_dropped: (f64, f64),
 }
 
 impl Meter {
@@ -3086,6 +3090,7 @@ impl Meter {
             logged: now,
             caption: None,
             started: now,
+            last_dropped: (0.0, 0.0),
         }
     }
 
@@ -3124,6 +3129,7 @@ impl Meter {
             let report_frames = std::mem::take(&mut self.report_frames) as f64;
             let dropped = crate::draw::take_dropped() as f64 / report_frames;
             let indirect = crate::list::take_indirect() as f64 / report_frames;
+            self.last_dropped = (dropped, indirect);
             let root_views = crate::draw::take_root_view_slots() as f64 / report_frames;
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
@@ -3205,6 +3211,7 @@ impl Meter {
         // draws run and those dropped: without a host pipeline, and
         // indirect ones the host could not prepare.
         let extra = CAPTION_EXTRA.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let (dropped, indirect) = self.last_dropped;
         // Running time since the first present (about the launch).
         let up = self.started.elapsed().as_secs();
         let (h, m, s) = (up / 3600, up / 60 % 60, up % 60);
