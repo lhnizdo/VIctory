@@ -1114,9 +1114,33 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
 /// to a page the title address no longer shows.
 static BESIDE_VIEWS: std::sync::RwLock<BTreeMap<usize, usize>> = std::sync::RwLock::new(BTreeMap::new());
 
+// A bit remembers that a 2 MiB region has ever had a writable section view.
+// Collisions and stale bits only lead to a lookup. A clear bit lets an
+// ordinary CRT copy go straight to its native operation. Even during
+// registration the native destination still faults on a protected page.
+const REGION_SHIFT: u32 = 21;
+static BESIDE_REGIONS: [std::sync::atomic::AtomicU64; 1024] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 1024];
+
+fn region_bit(region: usize) -> (&'static std::sync::atomic::AtomicU64, u64) {
+    (&BESIDE_REGIONS[(region / 64) % BESIDE_REGIONS.len()], 1u64 << (region % 64))
+}
+
+fn ordinary_destination(at: usize, len: usize) -> bool {
+    debug_assert!(len > 0);
+    let first = at >> REGION_SHIFT;
+    if at.saturating_add(len - 1) >> REGION_SHIFT != first {
+        return false;
+    }
+    let (word, mask) = region_bit(first);
+    word.load(std::sync::atomic::Ordering::Relaxed) & mask == 0
+}
+
 /// The runtime mapped a section's page at title address `at` (a 64 KiB
 /// page); `ours` shows the same page, writable, at an address of our own.
 pub fn title_memory_beside(at: usize, ours: usize) {
+    let (word, mask) = region_bit(at >> REGION_SHIFT);
+    word.fetch_or(mask, std::sync::atomic::Ordering::Relaxed);
     BESIDE_VIEWS.write().unwrap_or_else(|e| e.into_inner()).insert(at / PAGE, ours);
 }
 
@@ -1148,6 +1172,13 @@ fn bulk_chunk(at: usize, write: impl FnOnce(*mut u8)) -> bool {
 }
 
 fn bulk_write(mut at: usize, len: usize, write: impl Fn(*mut u8, usize, usize)) {
+    if len == 0 {
+        return;
+    }
+    if ordinary_destination(at, len) {
+        write(at as *mut u8, 0, len);
+        return;
+    }
     let mut offset = 0;
     while offset < len {
         let count = (PAGE - at % PAGE).min(len - offset);
@@ -1967,6 +1998,100 @@ pub(crate) mod tests {
                 assert_eq!(tracked_memcpy(dst, bytes.as_ptr(), 8), dst);
                 assert_eq!(std::slice::from_raw_parts(dst, 8), &bytes);
                 assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
+            }
+        });
+    }
+
+    #[test]
+    fn crt_fast_check_keeps_registered_pages_and_straddling_ranges() {
+        with_crt_views(1, 1, |a| {
+            assert!(!ordinary_destination(a, PAGE));
+            let next = ((a >> REGION_SHIFT) + 1) << REGION_SHIFT;
+            assert!(!ordinary_destination(next - 1, 2));
+            title_memory_beside_gone(a, PAGE);
+            // A remembered region can outlive its view. The locked lookup
+            // still falls back to a native write and cannot use a stale pointer.
+            assert!(!bulk_chunk(a, |_| panic!("unregistered view used")));
+        });
+    }
+
+    /// The cost of probing the section-view registry on ordinary CRT traffic.
+    /// Run alone so no section view has been registered for the pool's region.
+    #[test]
+    #[ignore]
+    fn ordinary_crt_copy_benchmark() {
+        let at = pool(1);
+        let src = [42u8; 64];
+        assert!(ordinary_destination(at, src.len()));
+        for filter in [false, true, true, false, false, true] {
+            let start = std::time::Instant::now();
+            for _ in 0..1_000_000 {
+                let dst = std::hint::black_box(at as *mut u8);
+                let bytes = std::hint::black_box(src.as_ptr());
+                // SAFETY: the pool and the source have at least 64 disjoint bytes.
+                unsafe {
+                    if filter {
+                        tracked_memcpy(dst, bytes, src.len());
+                    } else if !bulk_chunk(dst as usize, |out| std::ptr::copy(bytes, out, src.len())) {
+                        std::ptr::copy(bytes, dst, src.len());
+                    }
+                }
+            }
+            let ns = start.elapsed().as_nanos() as f64 / 1e6;
+            // SAFETY: the benchmark owns the pool and just filled those bytes.
+            assert_eq!(unsafe { std::slice::from_raw_parts(at as *const u8, 64) }, &src);
+            eprintln!("ordinary 64-byte CRT copy: region filter={filter}, {ns:.2} ns/copy");
+        }
+        free(at);
+    }
+
+    #[test]
+    fn concurrent_crt_writes_are_visible_after_the_last_take() {
+        use std::sync::{Barrier, atomic::{AtomicUsize, Ordering}};
+        const WRITERS: usize = 4;
+        const PAGES: usize = WRITERS * 2;
+        const ROUNDS: u8 = 120;
+        with_crt_views(PAGES, PAGES, |a| {
+            let end = a + PAGES * PAGE;
+            let tracker = track(a, PAGES * PAGE, true).unwrap();
+            tracker.take(a, end);
+            let start = Barrier::new(WRITERS + 1);
+            let done = AtomicUsize::new(0);
+            let mut mirror = [[0u8; 64]; PAGES];
+            let mut refresh = || {
+                for (from, to) in tracker.take(a, end) {
+                    for addr in (from..to).step_by(PAGE) {
+                        // ReadProcessMemory copies a snapshot while the title can write.
+                        assert!(crate::host::read_into(addr as *const u8, &mut mirror[(addr - a) / PAGE]));
+                    }
+                }
+            };
+            std::thread::scope(|scope| {
+                for worker in 0..WRITERS {
+                    let (start, done) = (&start, &done);
+                    scope.spawn(move || {
+                        start.wait();
+                        for round in 1..=ROUNDS {
+                            let value = round + worker as u8;
+                            let src = [value; 64];
+                            // SAFETY: each writer owns its two destination pages;
+                            // the kernel reads them for the tracker.
+                            unsafe {
+                                tracked_memcpy((a + worker * PAGE) as *mut u8, src.as_ptr(), 64);
+                                tracked_memset((a + (worker + WRITERS) * PAGE) as *mut u8, i32::from(value), 64);
+                            }
+                        }
+                        done.fetch_add(1, Ordering::Release);
+                    });
+                }
+                start.wait();
+                while done.load(Ordering::Acquire) != WRITERS {
+                    refresh();
+                }
+            });
+            refresh();
+            for (page, bytes) in mirror.iter().enumerate() {
+                assert_eq!(bytes, &[ROUNDS + (page % WRITERS) as u8; 64]);
             }
         });
     }
