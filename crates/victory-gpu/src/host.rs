@@ -3174,6 +3174,18 @@ impl Meter {
                     "faulting stores per frame: {looked:.0}, {understood:.0} understood, {same:.0} of them leaving the memory as it is, {stepped:.0} stepped over, {beside:.0} made beside the guards"
                 );
             }
+            #[cfg(feature = "diagnostics")]
+            {
+                let [wait, mark, open, faults] =
+                    crate::watch::FAULT_PARTS.each_ref().map(|a| a.swap(0, Ordering::Relaxed) as f64);
+                tracing::info!(
+                    "fault handler per frame: {:.0} faults; ms waiting for the guards {:.1}, marking the trackers {:.1}, opening {:.1}",
+                    faults / report_frames,
+                    wait / 1e3 / report_frames,
+                    mark / 1e3 / report_frames,
+                    open / 1e3 / report_frames,
+                );
+            }
             let m = crate::shadow::MARKED_PARTS.each_ref().map(|a| a.swap(0, Ordering::Relaxed) as f64);
             tracing::info!(
                 "marked pages, per frame: {:.0} went back changed, {:.0} equal, {:.0} kept the                  title's; ms unarming {:.1}, reading the title {:.1}, comparing {:.1}, writing {:.1}",

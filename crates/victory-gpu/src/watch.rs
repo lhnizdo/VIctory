@@ -913,15 +913,43 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     // Every page's bytes are saved before any is opened: once a page is
     // open, a write by another thread lands without a fault, and a save
     // after it would keep that write as the page's old bytes.
+    #[cfg(feature = "diagnostics")]
+    let marking = std::time::Instant::now();
     mark_changed(g, first, last, save);
     for &page in &others {
         mark_changed(g, page, page + 1, save);
     }
+    #[cfg(feature = "diagnostics")]
+    handler_part(1, marking);
+    #[cfg(feature = "diagnostics")]
+    let opening = std::time::Instant::now();
     open_guarded(g, first, last);
     for page in others {
         open_guarded(g, page, page + 1);
     }
+    #[cfg(feature = "diagnostics")]
+    handler_part(2, opening);
     guarded
+}
+
+/// The fault handler's time by part since the last report (diagnostics,
+/// microseconds): waiting for the shards, marking the trackers (their locks
+/// and saves), opening the blocks (`VirtualProtect`); and the faults.
+#[cfg(feature = "diagnostics")]
+pub(crate) static FAULT_PARTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// Set while this thread is in the fault handler: `changed` times its
+    /// parts into [`FAULT_PARTS`].
+    static IN_HANDLER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(feature = "diagnostics")]
+fn handler_part(part: usize, since: std::time::Instant) {
+    if IN_HANDLER.get() {
+        FAULT_PARTS[part].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
 }
 
 /// Gives write access back to the pages of `[first, last)` we guarded.
@@ -1189,8 +1217,19 @@ fn install() {
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
+        #[cfg(feature = "diagnostics")]
+        let waiting = std::time::Instant::now();
         let mut g = guards_pages(&[at / PAGE], false);
-        if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
+        #[cfg(feature = "diagnostics")]
+        {
+            IN_HANDLER.set(true);
+            handler_part(0, waiting);
+            FAULT_PARTS[3].fetch_add(1, Ordering::Relaxed);
+        }
+        let opened = changed(&mut g, at / PAGE, at / PAGE + 1, true);
+        #[cfg(feature = "diagnostics")]
+        IN_HANDLER.set(false);
+        if opened {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             #[cfg(feature = "diagnostics")]
