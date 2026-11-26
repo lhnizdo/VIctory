@@ -860,3 +860,48 @@ fn lds_in_one_wave64_wave_of_more_than_32_threads_is_refused() {
     lower_cs(&w, 32, 512, false).expect("one host wave");
     lower_cs(&w, 128, 512, false).expect("two console waves");
 }
+
+/// As the title's programs spill: s9 (s0 & 0: 0, from the table address
+/// the translation does not know) to lane 0 of v5, v4 = 64 and v3 = 1, before a
+/// branch; in threads 0-15, s10 = that lane of v5, v4 += s10 and
+/// `v_readfirstlane_b32` of v4 into v3. The read is of a value every lane
+/// computed alike (`lower::uniform`): no exchange, so the split takes it
+/// though not every thread arrives, with no group sync; 64 in threads 0-15
+/// and 1 elsewhere.
+fn readfirstlane_of_scalars_program() -> Vec<u32> {
+    let mut w = prologue();
+    w.push(sop2(0x0E, 9, s(0), k(0))); // s_and_b32 s9, s0, 0
+    w.push(v_mov_b32(4, k(64)));
+    w.push(v_mov_b32(3, k(1)));
+    w.extend(vop3(V_WRITELANE, 5, s(9), k(0), 0));
+    w.push(0x7D88_0090); // v_cmp_gt_u32 vcc, 16, v0
+    w.push(sop1(S_AND_SAVEEXEC_B64, 12, s(VCC)));
+    w.push(sopp(0x08, 5)); // s_cbranch_execz (the join)
+    w.extend(vop3(V_READLANE, 10, v(5), k(0), 0));
+    w.push(vop2(V_ADD, 4, s(10), 4));
+    w.push(v_readfirstlane_b32(8, v(4)));
+    w.push(v_mov_b32(3, s(8)));
+    w.push(0x88FE_0C7E); // s_or_b64 exec, exec, s[12:13]
+    w.extend(store(3, 0, 64));
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn a_first_lane_read_of_scalars_in_a_lane_branch_needs_no_exchange() {
+    let w = readfirstlane_of_scalars_program();
+    let names: Vec<&str> = {
+        let code: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+        crate::gfx10::decode(&code).expect("decode").iter().map(|i| i.name().unwrap_or("?")).collect()
+    };
+    for n in ["s_and_b32", "v_writelane_b32", "s_cbranch_execz", "v_readlane_b32", "v_readfirstlane_b32"] {
+        assert!(names.contains(&n), "{n} in {names:?}");
+    }
+    let (_, syncs) = lower_counting(&w, 64, 0, false).expect("taken by the split");
+    assert_eq!(syncs, 0, "the halves synced for a value alike in every lane");
+    let want: Vec<u32> = (0..64).map(|t| if t < 16 { 64 } else { 1 }).collect();
+    let ran32 = run_everywhere(&w, 64, 1, &want);
+    if ran32 == 0 {
+        eprintln!("no device ran 32-lane waves: skipped");
+    }
+}

@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod uniform;
 mod thread_ids;
 mod wave64;
 
@@ -6768,6 +6769,11 @@ impl<'a> Lower<'a> {
                     .is_some_and(|w| self.x.res.waterfall.reads.contains(&w.1)) =>
             {
                 // A waterfall loop's read of a descriptor dword: the lane's own.
+                let a = s(self, 0)?;
+                int(self, a)
+            }
+            // A value every lane active here holds (`uniform`).
+            "v_readfirstlane_b32" if self.reads_alike(inst) => {
                 let a = s(self, 0)?;
                 int(self, a)
             }
