@@ -1186,3 +1186,206 @@ fn a_wave64_select_on_a_mask_written_by_halves_takes_each_halfs_dword() {
     let want: Vec<u32> = (0..128).map(|l| u32::from(l & 32 != 0)).collect();
     assert_eq!(out, want);
 }
+
+/// Local check, no game data in the repo: `VICTORY_RADIX_CONTAINER` is the
+/// path of the console BVH builder's radix sort pass (512 threads; each
+/// group sorts a tile of 2048 keys (u0) and values (u1) by the 8 bits from
+/// constant 1 on, and scatters them to u4 and u5 at `u2[digit * groups +
+/// group] + u3[(digit * groups + group) >> constant 2] + rank`). One group,
+/// u3 zero, u2 the digits' exclusive counts: the output is the tile sorted
+/// stably by the digit. Run on the hardware adapter through title memory,
+/// for digits at bits 0 and 8.
+#[test]
+fn one_container_radix_pass_matches_its_reference() {
+    let Some(path) = std::env::var_os("VICTORY_RADIX_CONTAINER") else {
+        return;
+    };
+    const TITLE: u64 = 0x12_3450_0000;
+    const TILE: usize = 2048;
+    // Byte offsets in the one page: keys, values, offsets, coarse offsets,
+    // keys out, values out.
+    const AT: [u64; 6] = [0x0000, 0x2000, 0x4000, 0x4400, 0x5000, 0x7000];
+    let bytes = std::fs::read(path).expect("container");
+    super::set_host_wave64(false);
+    let shader = super::translate_with(&bytes, super::Options::default()).expect("translates");
+    assert!(shader.memory && shader.memory_writes, "root UAVs as title memory");
+    let (hi, lo) = ((TITLE >> 32) as u32, TITLE as u32);
+    let mut table = vec![0u32; 4096];
+    table[(hi << 4 | lo >> 28) as usize] = 1;
+    for _ in 0..2 * 4096 {
+        table.extend([2, 0]);
+    }
+    let entry = 4096 + 2 * (4096 + (lo >> 16 & 0xFFF) as usize);
+    table[entry..entry + 2].copy_from_slice(&[0, lo]);
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+    for shift in [0u32, 8] {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64 ^ u64::from(shift);
+        let mut memory = vec![0u32; 0x1_0000 / 4];
+        let w = |at: u64| at as usize / 4;
+        for i in 0..TILE {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            memory[w(AT[0]) + i] = seed as u32;
+            memory[w(AT[1]) + i] = i as u32;
+        }
+        let digit = |k: u32| (k >> shift & 255) as usize;
+        let mut counts = [0u32; 256];
+        for i in 0..TILE {
+            counts[digit(memory[w(AT[0]) + i])] += 1;
+        }
+        let mut first = [0u32; 256];
+        let mut sum = 0;
+        for d in 0..256 {
+            first[d] = sum;
+            sum += counts[d];
+        }
+        memory[w(AT[2])..w(AT[2]) + 256].copy_from_slice(&first);
+        let mut want = memory.clone();
+        let mut next = first;
+        for i in 0..TILE {
+            let (k, v) = (memory[w(AT[0]) + i], memory[w(AT[1]) + i]);
+            let p = next[digit(k)] as usize;
+            next[digit(k)] += 1;
+            want[w(AT[4]) + p] = k;
+            want[w(AT[5]) + p] = v;
+        }
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Descriptor, s) if (s as usize) < AT.len() => ((TITLE + AT[s as usize]) >> (32 * u.dword)) as u32,
+                (RootType::Constants, _) => [1, shift, 0][u.dword as usize],
+                _ => panic!("{u:?}"),
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (1, Root::View { srv: true, data: table.clone() }),
+                        (2, Root::Uav(2 * 4096 / 32)),
+                    ],
+                    views: &[View::Memory(&memory), View::Pair, View::NullPair, View::Pair],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        let got = &out[0];
+        for (name, at) in [("keys", AT[4]), ("values", AT[5])] {
+            let bad: Vec<usize> = (0..TILE).filter(|&p| got[w(at) + p] != want[w(at) + p]).collect();
+            if let Some(&p) = bad.first() {
+                let mut seen = got[w(AT[5])..w(AT[5]) + TILE].to_vec();
+                seen.sort_unstable();
+                seen.dedup();
+                panic!(
+                    "bits {shift}..: {} of {TILE} {name} wrong; first at {p}: {:#x} for {:#x} ({} distinct values out)",
+                    bad.len(),
+                    got[w(at) + p],
+                    want[w(at) + p],
+                    seen.len()
+                );
+            }
+        }
+        eprintln!("bits {shift}..: {TILE} keys and values in place");
+    }
+}
+
+/// Local check, no game data in the repo: `VICTORY_HISTOGRAM_CONTAINER` is
+/// the path of the console BVH builder's radix histogram (512 threads; each
+/// group counts the 8-bit digits, from bit constant 1 on, of its 2048 keys
+/// (u0) and stores count d at `u1[d * groups + group]`). The counts come from
+/// 64-lane compare masks used as data (`v_xor`, `v_bcnt`): in the split both
+/// halves must see the console wave's whole masks. One group, digits at bits
+/// 0 and 8, on the hardware adapter through title memory.
+#[test]
+fn one_container_radix_histogram_matches_its_reference() {
+    let Some(path) = std::env::var_os("VICTORY_HISTOGRAM_CONTAINER") else {
+        return;
+    };
+    const TITLE: u64 = 0x12_3450_0000;
+    const TILE: usize = 2048;
+    const AT: [u64; 2] = [0x0000, 0x4000];
+    let bytes = std::fs::read(path).expect("container");
+    super::set_host_wave64(false);
+    let shader = super::translate_with(&bytes, super::Options::default()).expect("translates");
+    assert!(shader.memory && shader.memory_writes, "root UAVs as title memory");
+    let (hi, lo) = ((TITLE >> 32) as u32, TITLE as u32);
+    let mut table = vec![0u32; 4096];
+    table[(hi << 4 | lo >> 28) as usize] = 1;
+    for _ in 0..2 * 4096 {
+        table.extend([2, 0]);
+    }
+    let entry = 4096 + 2 * (4096 + (lo >> 16 & 0xFFF) as usize);
+    table[entry..entry + 2].copy_from_slice(&[0, lo]);
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+    for shift in [0u32, 8] {
+        let mut seed = 0xD1B5_4A32_D192_ED03u64 ^ u64::from(shift);
+        let mut memory = vec![0u32; 0x1_0000 / 4];
+        let w = |at: u64| at as usize / 4;
+        let mut want = [0u32; 256];
+        for i in 0..TILE {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            // Few digits, many repeats (lanes sharing a digit).
+            let k = (seed as u32) & !(0xE0u32 << shift);
+            memory[w(AT[0]) + i] = k;
+            want[(k >> shift & 255) as usize] += 1;
+        }
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Descriptor, s) if (s as usize) < AT.len() => ((TITLE + AT[s as usize]) >> (32 * u.dword)) as u32,
+                (RootType::Descriptor, _) => 0,
+                (RootType::Constants, _) => [1, shift, 0][u.dword as usize],
+                _ => panic!("{u:?}"),
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (1, Root::View { srv: true, data: table.clone() }),
+                        (2, Root::Uav(2 * 4096 / 32)),
+                    ],
+                    views: &[View::Memory(&memory), View::Pair, View::NullPair, View::Pair],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        let got = &out[0][w(AT[1])..w(AT[1]) + 256];
+        let total: u32 = got.iter().sum();
+        let bad: Vec<usize> = (0..256).filter(|&d| got[d] != want[d]).collect();
+        assert!(
+            bad.is_empty(),
+            "bits {shift}..: {} of 256 counts wrong (total {total} of {TILE}); first digit {}: {} for {}",
+            bad.len(),
+            bad[0],
+            got[bad[0]],
+            want[bad[0]]
+        );
+        eprintln!("bits {shift}..: 256 counts match");
+    }
+}
