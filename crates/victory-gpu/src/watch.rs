@@ -1078,6 +1078,121 @@ pub(crate) mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
+    /// Phase 0 of the guard-lock plan: a measure of the guards under
+    /// contention that does not depend on a title run, and a check that no
+    /// write is lost. `VICTORY_BENCH_THREADS` threads (8) store words into
+    /// random pages of a tracked pool of `VICTORY_BENCH_PAGES` pages (256),
+    /// faulting on the taken ones; one thread writes through [`writing`] as
+    /// our own writes into title memory do; the test's thread takes the pool
+    /// over and over and copies every page a take reports into a copy of its
+    /// own. After `VICTORY_BENCH_SECS` seconds (5) everything stops, a last
+    /// take brings the copy up to date, and it must equal the pool byte for
+    /// byte: a write no take reported (the guards losing one) shows there.
+    /// Prints the rates (and, with diagnostics, the guard lock's holders).
+    #[test]
+    #[ignore]
+    fn guard_contention_benchmark() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+        let env = |name: &str, default: usize| {
+            std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+        };
+        let (threads, pages, secs) = (
+            env("VICTORY_BENCH_THREADS", 8),
+            env("VICTORY_BENCH_PAGES", 256),
+            env("VICTORY_BENCH_SECS", 5),
+        );
+        let p = pool(pages);
+        let len = pages * PAGE;
+        let t = track(p, len, true).expect("tracked");
+        let mut copy = vec![0u8; len];
+        let mut bring = |runs: Vec<(usize, usize)>, copy: &mut [u8]| -> usize {
+            let mut n = 0;
+            for (a, b) in runs {
+                // SAFETY: bytes of our pool, readable whether guarded or not.
+                let there = unsafe { std::slice::from_raw_parts(a as *const u8, b - a) };
+                copy[a - p..b - p].copy_from_slice(there);
+                n += (b - a) / PAGE;
+            }
+            n
+        };
+        bring(t.take(p, p + len), &mut copy);
+        #[cfg(feature = "diagnostics")]
+        let _ = held_times();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stores = Arc::new(AtomicU64::new(0));
+        let ours = Arc::new(AtomicU64::new(0));
+        let mut joins = Vec::new();
+        for k in 0..threads {
+            let (stop, stores) = (stop.clone(), stores.clone());
+            joins.push(std::thread::spawn(move || {
+                let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ (k as u64 + 1).wrapping_mul(0xD1B5_4A32_D192_ED03);
+                let mut n = 0u64;
+                while !stop.load(Relaxed) {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    let at = p + (x as usize % (len / 4)) * 4;
+                    // SAFETY: a dword of our pool; a guarded one faults into
+                    // the handler, which opens it.
+                    unsafe { (at as *mut u32).write_volatile(x as u32) };
+                    n += 1;
+                }
+                stores.fetch_add(n, Relaxed);
+            }));
+        }
+        {
+            let (stop, ours) = (stop.clone(), ours.clone());
+            joins.push(std::thread::spawn(move || {
+                let mut x = 0x2545_F491_4F6C_DD1Du64;
+                let mut n = 0u64;
+                while !stop.load(Relaxed) {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    let page = x as usize % pages;
+                    let at = p + page * PAGE + (x as usize >> 20) % (PAGE / 4) * 4;
+                    let w = writing(at, 4);
+                    // SAFETY: a dword of our pool, open while `w` lives.
+                    unsafe { (at as *mut u32).write_volatile(!(x as u32)) };
+                    drop(w);
+                    n += 1;
+                }
+                ours.fetch_add(n, Relaxed);
+            }));
+        }
+        let start = std::time::Instant::now();
+        let (mut takes, mut taken) = (0u64, 0usize);
+        while start.elapsed() < std::time::Duration::from_secs(secs as u64) {
+            taken += bring(t.take(p, p + len), &mut copy);
+            takes += 1;
+        }
+        stop.store(true, Relaxed);
+        for j in joins {
+            j.join().expect("a writer");
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        bring(t.take(p, p + len), &mut copy);
+        // SAFETY: our pool, no writer left.
+        let pool_bytes = unsafe { std::slice::from_raw_parts(p as *const u8, len) };
+        let lost = (0..pages).filter(|&k| copy[k * PAGE..(k + 1) * PAGE] != pool_bytes[k * PAGE..(k + 1) * PAGE]).count();
+        eprintln!(
+            "guards, {threads} threads, {pages} pages, {elapsed:.1} s: {:.0} title stores/s, {:.0} of ours/s, \
+             {:.0} takes/s ({:.1} pages a take); {lost} pages lost",
+            stores.load(Relaxed) as f64 / elapsed,
+            ours.load(Relaxed) as f64 / elapsed,
+            takes as f64 / elapsed,
+            taken as f64 / takes.max(1) as f64,
+        );
+        #[cfg(feature = "diagnostics")]
+        for (line, ms, longest) in held_times().into_iter().take(6) {
+            eprintln!("  guard lock held at watch.rs:{line}: {:.0} ms/s (longest {longest:.2} ms)", ms / elapsed);
+        }
+        drop(t);
+        free(p);
+        assert_eq!(lost, 0, "pages whose writes no take reported");
+    }
+
     /// Everything is changed at first; after taking, only what is written
     /// (by faults, or reported) is, and every tracker of a page sees it.
     #[test]
