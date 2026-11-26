@@ -305,13 +305,46 @@ fn skip_hashes() -> &'static [String] {
 
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader<'a>(shaders: &'a [Arc<Shader>], hashes: &[String]) -> Option<&'a str> {
-    if hashes.is_empty() {
+    let names = skip_names();
+    if hashes.is_empty() && names.is_empty() {
         return None;
     }
     shaders
         .iter()
-        .find(|shader| hashes.contains(&shader.hash))
+        .find(|shader| {
+            hashes.contains(&shader.hash)
+                || names.iter().any(|n| {
+                    let hit = shader.container.windows(n.len()).any(|w| w == n.as_bytes());
+                    if hit {
+                        static SEEN: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let k = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if k.is_power_of_two() {
+                            tracing::info!(name = %n, hash = %shader.hash, skipped = k,
+                                "VICTORY_SKIP_NAMED: pipeline left out");
+                        }
+                    }
+                    hit
+                })
+        })
         .map(|shader| shader.hash.as_str())
+}
+
+/// `VICTORY_SKIP_NAMED=a,b`: pipelines with a shader whose container holds
+/// one of these names (an entry point such as `CS_RaytracingResolve`) are
+/// left out like `VICTORY_SKIP_PIPELINES`' hashes.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skip_names() -> &'static [String] {
+    static NAMES: OnceLock<Vec<String>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        std::env::var("VICTORY_SKIP_NAMED")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
