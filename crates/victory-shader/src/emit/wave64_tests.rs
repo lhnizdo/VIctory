@@ -569,9 +569,10 @@ const fn ds_bpermute_b32(vdst: u8, addr: u8, data0: u8) -> [u32; 2] {
 /// What the permutes start from in the lanes outside their EXEC.
 const PERMUTE_OLD: u32 = 0xDEAD_0000;
 
-/// `ds_bpermute_b32` of lane `(l + 37) & 63` (half the lanes read the
-/// other half), with every lane in EXEC, then under the lanes whose x has
-/// bit 0 (lanes outside EXEC read 0).
+/// `ds_bpermute_b32` of lane `(l + 37) & 63`, with every lane in EXEC,
+/// then under the lanes whose x has bit 0 (lanes outside EXEC read 0). A
+/// wave64 permute reads within its own 32-lane half (RDNA 2 ISA, 10.4.4):
+/// the lane named, taken in the reader's half (from #3147).
 fn permute_program(threads: u32) -> Vec<u32> {
     let mut w = prologue();
     w.push(vop2(V_ADD, 3, k(37), 0));
@@ -595,7 +596,7 @@ fn permute_model(threads: u32) -> Vec<u32> {
     for wave in waves(threads) {
         let odd = mask(&wave, |t| data(t) & 1 != 0);
         for t in wave.clone() {
-            let from = (t % 64 + 37) & 63;
+            let from = ((t % 64) & 32) | ((t % 64 + 37) & 31);
             let src = wave.start + from;
             let all = if src < wave.end { data(src) } else { 0 };
             want[t as usize] = all;
@@ -698,7 +699,7 @@ fn a_ballot_after_a_branch_joins_the_halves() {
 }
 
 #[test]
-fn permutes_read_lanes_of_the_other_half() {
+fn permutes_read_lanes_of_their_own_half() {
     let mut ran32 = 0;
     for threads in GROUPS {
         ran32 += run_everywhere(
@@ -777,18 +778,18 @@ fn a_lane_read_in_a_loop_is_refused_without_64_lane_waves() {
 }
 
 /// LDS in a group that is one console wave: the console compiler leaves
-/// out the barriers that two host waves would need.
+/// out the barriers that two host waves would need, so the split refuses
+/// it per lane and the game stack runs it as the console runs it
+/// (`Lower::split_console`), its halves synced.
 #[test]
-fn lds_in_one_wave64_wave_of_more_than_32_threads_is_refused() {
+fn lds_in_one_wave64_wave_of_more_than_32_threads_runs_as_the_console() {
     let mut w = prologue();
     w.extend(vop3(V_READLANE, 14, v(1), k(40), 0));
     w.push(v_mov_b32(5, s(14)));
     w.extend(store(5, 0, 64));
     w.push(S_ENDPGM);
-    let Err(e) = lower_cs(&w, 64, 512, false) else {
-        panic!("not refused")
-    };
-    assert!(e.contains("LDS shared without barriers"), "{e}");
+    let (_, syncs) = lower_counting(&w, 64, 512, false).expect("run as the console runs it");
+    assert!(syncs > 0, "the halves never synced");
     lower_cs(&w, 64, 512, true).expect("lowered for 64-lane waves");
     lower_cs(&w, 32, 512, false).expect("one host wave");
     lower_cs(&w, 128, 512, false).expect("two console waves");

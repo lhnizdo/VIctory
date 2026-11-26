@@ -316,6 +316,8 @@ struct Lower<'a> {
     heap: [bool; 2],
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
+    /// EXEC's lanes for `v_readfirstlane` (from #3147, RaghavVijayanand).
+    exec_lanes: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
@@ -793,6 +795,7 @@ impl<'a> Lower<'a> {
             writes_uavs,
             heap: [false; 2],
             src0: None,
+            exec_lanes: None,
             console_lanes,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
@@ -5972,10 +5975,13 @@ impl<'a> Lower<'a> {
         }
         // A scalar result (`v_readlane`, `v_readfirstlane`) is written
         // whatever EXEC holds.
-        let mut guard = match v.dst {
-            Some(Operand::Scalar { .. }) => None,
-            _ => self.guard(b, i)?,
+        let scalar = matches!(v.dst, Some(Operand::Scalar { .. }));
+        let lanes = if !scalar || inst.name() == "v_readfirstlane_b32" {
+            self.guard(b, i)?
+        } else {
+            None
         };
+        let mut guard = if scalar { None } else { lanes };
         if let Some(d) = v.dpp {
             let (x, enable) = self.dpp(inst, d, guard)?;
             guard = match (guard, enable) {
@@ -5990,8 +5996,10 @@ impl<'a> Lower<'a> {
         if NO_FIRST_OWN.load(std::sync::atomic::Ordering::Relaxed) {
             self.first_is_own = false;
         }
+        self.exec_lanes = lanes;
         let r = self.valu_op(inst, guard);
         self.src0 = None;
+        self.exec_lanes = None;
         self.first_is_own = false;
         r
     }
@@ -6999,7 +7007,7 @@ impl<'a> Lower<'a> {
             }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
-                let r = self.first_lane(a, guard)?;
+                let r = self.first_lane(a, guard.or(self.exec_lanes))?;
                 let r = self.helper_reads_own(a, r);
                 int(self, r)
             }
