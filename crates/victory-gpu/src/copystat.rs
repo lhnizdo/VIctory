@@ -234,12 +234,31 @@ pub(crate) fn fault_site(rip: usize, at: usize) {
 /// What title memory at `at` is: a shader-visible descriptor heap, memory a
 /// buffer's host copy covers, or neither.
 fn kind_of(at: usize) -> &'static str {
-    if crate::descriptor::in_shader_heap(at as u64) {
-        "heap"
-    } else if crate::shadow::find(at as u64, 1).is_some() {
-        "buffer"
-    } else {
-        "other"
+    // And how the memory is allocated: a section's view (a second view of it
+    // could take a store beside the guard) or private memory (no other way
+    // to its pages).
+    #[cfg(windows)]
+    let mapped = {
+        use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        n != 0 && info.Type == MEM_MAPPED
+    };
+    #[cfg(not(windows))]
+    let mapped = false;
+    match (
+        crate::descriptor::in_shader_heap(at as u64),
+        crate::shadow::find(at as u64, 1).is_some(),
+        mapped,
+    ) {
+        (true, _, true) => "heap/mapped",
+        (true, _, false) => "heap/private",
+        (false, true, true) => "buffer/mapped",
+        (false, true, false) => "buffer/private",
+        (false, false, true) => "other/mapped",
+        (false, false, false) => "other/private",
     }
 }
 
