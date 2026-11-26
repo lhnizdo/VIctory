@@ -7,6 +7,157 @@
 
 use super::*;
 
+/// Whether a wave64 compute program of one console wave per group, which
+/// the split refuses, may run with each half of the console wave as a wave
+/// of its own (32 host lanes, no exchange: [`Lower::per_half`]). HLSL's wave
+/// operations hold for any wave size, so that is the program on 32-lane
+/// hardware; it differs only where the program relies on 64 lanes. Allowed
+/// here is the console compiler's atomic optimizer and what follows from
+/// it: lane counts, first lanes and sums over the wave go only into an
+/// atomic's data or the choice of the lane that does it, and what the
+/// atomic returns with ranks added (a slot) goes anywhere. Refused: LDS
+/// (one wave runs in lockstep, two do not), a value over lanes stored, used
+/// as an address or deciding a branch, or an atomic not combining.
+impl<'a> Lower<'a> {
+pub(super) fn per_half_ok(&self) -> Result<(), Why> {
+    use crate::gfx10::Fields;
+    let x = self.x;
+    const AGG: u8 = 1; // computed over lanes
+    const SLOT: u8 = 2; // an atomic's result, a lane's rank
+    const FIRST: u8 = 4; // the first lane's index (`s_ff1`)
+    const RANK: u8 = 8; // `v_mbcnt`
+    let (p, st) = (x.p, x.st);
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut flags: HashMap<Value, u8> = HashMap::new();
+    let mut atomic = false;
+    let of = |flags: &HashMap<Value, u8>, v: Value| flags.get(&v).copied().unwrap_or(0);
+    let aggregate_only = |f: u8| f & AGG != 0 && f & SLOT == 0;
+    // Registers of an operand, as instruction reads name them.
+    let regs = |op: &Operand| -> Vec<Reg> {
+        match *op {
+            Operand::Vector { reg, dwords } => (0..dwords).map(|k| Reg::V(reg + k)).collect(),
+            Operand::Scalar { code, dwords } => (0..dwords).map(|k| Reg::S(code + k)).collect(),
+            _ => Vec::new(),
+        }
+    };
+    loop {
+        let mut changed = false;
+        let mut set = |flags: &mut HashMap<Value, u8>, v: Value, f: u8| {
+            let old = flags.get(&v).copied().unwrap_or(0);
+            if old | f != old {
+                flags.insert(v, old | f);
+                changed = true;
+            }
+        };
+        for &b in &order {
+            let block = &p.blocks[b];
+            for phi in &block.phis {
+                let f = phi.args.iter().fold(0, |f, &a| f | of(&flags, a));
+                set(&mut flags, phi.value, f);
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                let name = inst.name();
+                let read = inst.reads.iter().fold(0, |f, r| f | of(&flags, r.1));
+                let exec_write = inst.writes.iter().any(|w| matches!(w.0, Reg::S(c) if c == EXEC || c == EXEC + 1));
+                let mut out = read & (AGG | SLOT);
+                match &inst.fields {
+                    Fields::Ds { .. } => return Err("LDS in a program run per half"),
+                    Fields::Buffer { .. } | Fields::Flat { .. } | Fields::Image { .. } if name.contains("atomic") => {
+                        atomic = true;
+                        let data = match &inst.fields {
+                            Fields::Buffer { data, .. } | Fields::Flat { data, .. } => {
+                                data.as_ref().map(regs).unwrap_or_default()
+                            }
+                            Fields::Image { data, .. } => regs(data),
+                            _ => Vec::new(),
+                        };
+                        let combining = ["add", "sub", "and", "or", "xor", "min", "max", "inc", "dec"]
+                            .iter()
+                            .any(|o| name.contains(o))
+                            && !name.contains("swap");
+                        for &(reg, v) in &inst.reads {
+                            let f = of(&flags, v);
+                            if data.contains(&reg) {
+                                if f & AGG != 0 && !combining {
+                                    return Err("a value over lanes in an atomic that does not combine");
+                                }
+                            } else if aggregate_only(f) {
+                                return Err("a value over lanes in an atomic's address");
+                            }
+                        }
+                        out = SLOT;
+                    }
+                    Fields::Buffer { .. } | Fields::Flat { .. } | Fields::Image { .. }
+                        if name.contains("store") =>
+                    {
+                        if inst.reads.iter().any(|r| aggregate_only(of(&flags, r.1))) {
+                            return Err("a value over lanes stored, or as an address");
+                        }
+                    }
+                    _ if name.contains("store") || name.starts_with("exp") => {
+                        if inst.reads.iter().any(|r| aggregate_only(of(&flags, r.1))) {
+                            return Err("a value over lanes stored");
+                        }
+                    }
+                    _ if name == "s_ff1_i32_b64" => out |= AGG | FIRST,
+                    _ if name.starts_with("s_bcnt") || name.starts_with("s_ff0") || name.starts_with("s_flbit") => {
+                        out |= AGG
+                    }
+                    _ if name.starts_with("v_mbcnt") => out |= SLOT | RANK,
+                    _ if name == "v_readlane_b32" || name == "v_readfirstlane_b32" => {
+                        let restored = inst.writes.first().is_some_and(|w| st.restored.contains_key(&w.1));
+                        // A value every lane computed alike: the lane's own.
+                        let alike = name == "v_readfirstlane_b32" && read == 0 && self.why_not_scalars(b, i, true).is_none();
+                        #[cfg(test)]
+                        if std::env::var_os("VICTORY_ONE_CONTAINER").is_some() && !alike && !restored {
+                            let r: Vec<_> = inst.reads.iter().map(|r| (r.0, of(&flags, r.1))).filter(|r| r.1 != 0).collect();
+                            eprintln!("lane read at {:#x} {name}: flagged reads {r:?}, scalars {:?}", inst.machine.offset, self.why_not_scalars(b, i, true));
+                        }
+                        if !restored && !alike {
+                            // The first lane's slot is a slot; anything else read
+                            // from another lane is over lanes.
+                            out |= if read & SLOT != 0 && read & AGG == 0 { SLOT } else { AGG };
+                        }
+                    }
+                    Fields::Valu(v) if v.dpp.is_some() || name.starts_with("v_permlane") => out |= AGG,
+                    Fields::Valu(_) if name.starts_with("v_cmp") => {
+                        // The first-lane test: `s_ff1` of EXEC against the rank.
+                        let firsts = inst.reads.iter().any(|r| of(&flags, r.1) & FIRST != 0);
+                        let ranks = inst.reads.iter().any(|r| of(&flags, r.1) & RANK != 0);
+                        if firsts && ranks && name.contains("_eq_") {
+                            out = 0;
+                        }
+                    }
+                    _ if name.starts_with("s_cbranch") => {
+                        if aggregate_only(read) {
+                            return Err("a branch decided by a value over lanes");
+                        }
+                    }
+                    _ => {}
+                }
+                if exec_write && aggregate_only(out) {
+                    #[cfg(test)]
+                    if std::env::var_os("VICTORY_ONE_CONTAINER").is_some() {
+                        eprintln!("EXEC over lanes at {:#x} {name}", inst.machine.offset);
+                    }
+                    return Err("EXEC set from a value over lanes");
+                }
+                for &(_, w) in &inst.writes {
+                    set(&mut flags, w, out);
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    if !atomic {
+        return Err("no atomic: nothing a program run per half is known to keep");
+    }
+    Ok(())
+}
+}
+
 impl<'a> Lower<'a> {
     /// Console mode's parked lanes ([`Lower::parked`]): a phi of whether a
     /// lane is parked at every loop header, false on entry. A latch whose
