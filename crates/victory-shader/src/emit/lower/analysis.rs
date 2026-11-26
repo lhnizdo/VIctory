@@ -20,12 +20,37 @@ impl<'a> Lower<'a> {
         let loops = self.barrier_loops(order);
         let headers: Vec<usize> = self.counters.keys().copied().collect();
         for h in headers {
-            let Some(&(_, last, _)) = loops.iter().find(|l| l.0 == h) else {
+            // The natural loop: the header and every block reaching one of
+            // its latches without passing it. Only those may read the
+            // header's phi.
+            let mut body = vec![false; self.x.p.blocks.len()];
+            body[h] = true;
+            let mut todo: Vec<usize> = loops.iter().filter(|l| l.0 == h).map(|l| l.1).collect();
+            if todo.is_empty() {
                 continue;
-            };
+            }
+            let latches = todo.clone();
+            while let Some(x) = todo.pop() {
+                if body[x] || self.block[x].is_none() {
+                    continue;
+                }
+                body[x] = true;
+                todo.extend(self.x.p.blocks[x].preds.iter().copied());
+            }
+            // Only a loop one of whose latches parks lanes: its exit decided
+            // for the wave, the other side leaving the loop. Every other
+            // loop is lowered as before (no phi, no guard more).
+            let parks = latches.iter().any(|&l| {
+                self.wave_branches.contains_key(&l)
+                    && matches!(self.x.st.exits[l], LaneExit::Branch { taken, not_taken, .. }
+                        if (taken == h && !body[not_taken]) || (not_taken == h && !body[taken]))
+            });
+            if !parks {
+                continue;
+            }
             let blk = self.block[h].expect("reachable");
             let phi = self.s.m.phi(blk, self.s.t.i1);
-            self.parked.insert(h, (phi, Vec::new(), last));
+            self.parked.insert(h, (phi, Vec::new(), body));
         }
     }
 
@@ -35,8 +60,8 @@ impl<'a> Lower<'a> {
         let parked: Vec<V> = self
             .parked
             .iter()
-            .filter(|&(&h, &(_, _, last))| self.rpo[h] <= self.rpo[b] && self.rpo[b] <= self.rpo[last])
-            .map(|(_, &(phi, _, _))| phi)
+            .filter(|(_, p)| p.2[b])
+            .map(|(_, p)| p.0)
             .collect();
         let mut guard = guard;
         for phi in parked {

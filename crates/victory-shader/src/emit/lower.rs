@@ -27,8 +27,9 @@ mod wave64;
 type Why = &'static str;
 
 /// A loop's parked lanes ([`Lower::parked`]): the header's phi, its
-/// incoming (value, DXIL block) pairs, and the loop's last block in RPO.
-type Parked = (V, Vec<(V, usize)>, usize);
+/// incoming (value, DXIL block) pairs, and per IR block whether it is in
+/// the loop (its natural body, which the header dominates).
+type Parked = (V, Vec<(V, usize)>, Vec<bool>);
 
 #[derive(Debug, Clone, Copy)]
 enum Val {
@@ -10311,9 +10312,20 @@ impl<'a> Lower<'a> {
                     .map_err(|w| unsupported(offset, w))?;
                 let i1 = self.s.t.i1;
                 let (name, opcode) = if all { ("waveAllTrue", 114) } else { ("waveAnyTrue", 113) };
+                // Parked lanes are out of the wave's test (`Lower::parked`).
+                let voting = if all {
+                    let c = self.cur;
+                    let yes = self.s.m.bool(true);
+                    let against = self.s.m.bin(c, Bin::Xor, lane, yes);
+                    let against = self.unparked(b, Some(against)).expect("a guard");
+                    let c = self.cur;
+                    self.s.m.bin(c, Bin::Xor, against, yes)
+                } else {
+                    self.unparked(b, Some(lane)).expect("a guard")
+                };
                 let cond = self
                     .s
-                    .op(self.cur, name, Attr::NoUnwind, i1, opcode, &[lane]);
+                    .op(self.cur, name, Attr::NoUnwind, i1, opcode, &[voting]);
                 self.s.flags |= flags::WAVE_OPS;
                 // A console wave split into two host waves: the other
                 // half's answer too, so both take the branch alike (every
@@ -10348,9 +10360,7 @@ impl<'a> Lower<'a> {
                     .into_iter()
                     .find(|&(round, out, _)| {
                         back(self, round)
-                            && self.parked.get(&round).is_some_and(|p| {
-                                !(self.rpo[round] <= self.rpo[out] && self.rpo[out] <= self.rpo[p.2])
-                            })
+                            && self.parked.get(&round).is_some_and(|p| !p.2[out])
                     });
                 if let Some((header, _, leaves_when_taken)) = latch {
                     let c = self.cur;
