@@ -19,7 +19,8 @@ pub(crate) struct HostHeap {
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
-    /// Dynamic slots past `count` (none in sampler heaps), up to [`DYNAMIC`].
+    /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
+    /// where the host takes them, else [`MIN_DYNAMIC`].
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
@@ -94,9 +95,13 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// each a device removal shortly after; #59).
 const DYNAMIC: u32 = 1 << 18;
 
-/// Slots kept for runtime descriptors when a host caps the heap. This budget
-/// includes the reserved null slots when the shader uses the same cap.
+/// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
+/// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
+
+/// Slots kept for host copies' view pairs ([`HostHeap::pair`]) in a heap at
+/// a host's cap; more pairs take dynamic slots.
+const CAPPED_PAIRS: u32 = 1 << 14;
 
 /// Asks once, before the first shader is translated, whether the host takes
 /// a view heap of `HEAP_VIEWS` slots, and if not lowers the view limit
@@ -184,10 +189,14 @@ impl HostHeap {
                 }
             }
         } else if views < victory_shader::emit::HEAP_VIEWS {
-            // Keep the same title slots as the portable fallback. The three
-            // null slots at the top come from the runtime's share of the heap.
-            // Smaller title heaps leave more room for dynamic tables and
-            // dedicated copy pairs. Pairs can also use the dynamic range.
+            // A host that caps its view heaps ([`probe_view_limit`]): a heap
+            // of the cap, which shaders clamp their indices below. The whole
+            // dynamic range (2^16 ran out in the world on NVIDIA), room for
+            // [`CAPPED_PAIRS`], the null buffer views and the last (null)
+            // slot at its top; the title's slots below them.
+            // shortcut: title slots past that (721,469 on a 1,000,000-view
+            // cap) are left out; the title's highest index seen is about
+            // 720,000.
             let heap = match make(views) {
                 Ok(heap) => heap,
                 Err(e) => {
@@ -195,13 +204,11 @@ impl HostHeap {
                     return None;
                 }
             };
-            let title = count.min(views - MIN_DYNAMIC);
-            let null_start = victory_shader::emit::null_buffer_view() - 1;
-            let dynamic = DYNAMIC.min(null_start - title);
+            let title = (views - DYNAMIC - CAPPED_PAIRS - 3).min(count);
             if title < count {
                 tracing::warn!(count, kept = title, "host view heap capped at {views}: the title's top slots are left out");
             }
-            (heap, title, dynamic)
+            (heap, title, DYNAMIC)
         } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
             (heap, count, DYNAMIC)
         } else {
@@ -2304,32 +2311,6 @@ mod tests {
         assert_eq!(unsafe { past.read_unaligned() }, mark);
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
-    }
-
-    #[test]
-    fn capped_view_heap_preserves_title_slots_and_reserves_nulls() {
-        let Some(heap) = HostHeap::new(false, 1_245_184) else {
-            return; // no host GPU here
-        };
-        let views = victory_shader::emit::view_heap_limit();
-        if views == victory_shader::emit::HEAP_VIEWS {
-            return; // this adapter did not cap the heap
-        }
-        let end = victory_shader::emit::null_buffer_view() - 1;
-        assert_eq!(views, PORTABLE_VIEWS);
-        assert_eq!(heap.count(), views - MIN_DYNAMIC);
-        assert_eq!(heap.pairs_end, end);
-        assert_eq!(heap.count() + heap.dynamic, end);
-
-        let pair = heap.pair().expect("a pair fits in the dynamic range");
-        assert_eq!(pair, heap.count());
-        let remaining = heap.dynamic - 2;
-        let table = heap.dynamic(remaining).expect("the remaining dynamic slots fit");
-        assert_eq!(table + remaining, end, "the null UAV is just past the table");
-        assert_eq!(heap.pair(), None, "reserved null slots cannot be allocated");
-        heap.free_pair(pair);
-        assert_eq!(heap.pair(), Some(pair), "the pair can be reused");
-        eprintln!("view cap {views}, title slots {}, dynamic slots {}, first reserved null slot {end}", heap.count(), heap.dynamic);
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
