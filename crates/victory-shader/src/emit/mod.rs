@@ -227,6 +227,8 @@ mod shader;
 mod stride_tests;
 #[cfg(all(test, windows))]
 mod synthetic_tests;
+#[cfg(all(test, windows))]
+mod wave64_console_tests;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
