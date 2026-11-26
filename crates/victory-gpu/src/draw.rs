@@ -1100,6 +1100,8 @@ impl State {
             dropped(list, self.pipeline, "dispatch");
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        self.check_tree(list);
         // The acceleration-structure builder runs whole or not at all
         // (`pipeline::builder`).
         if crate::pipeline::held_back(self.pipeline as This) {
@@ -1409,6 +1411,92 @@ impl State {
         if frame.len() < 256 {
             frame.push(line);
         }
+    }
+
+    /// Diagnostics, `VICTORY_BUILDER_CHECK=<hash>`: for the first 40
+    /// dispatches of the builder's bottom-up refit with that shader (root
+    /// views: u0 a header with the leaf count n at byte 12, u2 the parent of
+    /// each of the 2n - 1 nodes, u3 the two children of each of the n - 1
+    /// inner nodes), once the list has run: whether every node's parents
+    /// reach the root (-1) without a cycle, and the children point back.
+    /// Run with the refit dropped (`VICTORY_BUILDER_DROP`), or the device
+    /// hangs before the list ends.
+    #[cfg(feature = "diagnostics")]
+    fn check_tree(&self, list: &HostList) {
+        static WANT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        static CHECKED: AtomicU64 = AtomicU64::new(0);
+        let want = WANT.get_or_init(|| std::env::var("VICTORY_BUILDER_CHECK").unwrap_or_default());
+        if want.is_empty() || !crate::pipeline::shaders_of(self.pipeline as This).contains(want.as_str()) {
+            return;
+        }
+        let k = CHECKED.fetch_add(1, Ordering::Relaxed);
+        if k >= 40 {
+            return;
+        }
+        let roots = self.roots_ref(true);
+        let at = |s: usize| match roots.get(s) {
+            Some(Root::View(a)) => Some(*a),
+            _ => None,
+        };
+        let (Some(header), Some(parents), Some(children)) = (at(0), at(2), at(3)) else {
+            tracing::info!(k, "tree check: the refit's root views are not all set");
+            return;
+        };
+        list.defer_after(move || {
+            let read = |a: u64, n: usize| crate::shadow::find(a, 4 * n as u64).and_then(|s| s.dwords(a, n));
+            let Some(n) = read(header + 12, 1).map(|v| v[0] as usize) else {
+                tracing::info!(k, header = format_args!("{header:#x}"), "tree check: no host copy of the header");
+                return;
+            };
+            if n < 2 || n > 1 << 22 {
+                tracing::info!(k, n, "tree check: leaf count out of range");
+                return;
+            }
+            let nodes = 2 * n - 1;
+            let (Some(up), Some(kids)) = (read(parents, nodes), read(children, 2 * (n - 1))) else {
+                tracing::info!(k, n, "tree check: no host copy of the parents or children");
+                return;
+            };
+            let (mut roots_seen, mut out_of_range, mut cycles, mut first_cycle) = (0, 0, 0, None);
+            for start in 0..nodes {
+                let mut v = start;
+                let mut steps = 0;
+                loop {
+                    let p = up[v];
+                    if p == u32::MAX {
+                        if steps == 0 {
+                            roots_seen += 1;
+                        }
+                        break;
+                    }
+                    if p as usize >= n - 1 {
+                        out_of_range += 1;
+                        break;
+                    }
+                    v = p as usize;
+                    steps += 1;
+                    if steps > nodes {
+                        cycles += 1;
+                        first_cycle.get_or_insert(start);
+                        break;
+                    }
+                }
+            }
+            let back = (0..n - 1)
+                .filter(|&i| (0..2).any(|c| kids.get(2 * i + c).is_some_and(|&ch| (ch as usize) < nodes && up[ch as usize] != i as u32)))
+                .count();
+            tracing::info!(
+                k,
+                n,
+                roots = roots_seen,
+                out_of_range,
+                cycles,
+                first_cycle = ?first_cycle,
+                children_not_pointing_back = back,
+                parent_head = ?&up[..up.len().min(8)],
+                "tree check"
+            );
+        });
     }
 
     /// In a listed frame: each small buffer (64 bytes at most) the draw's

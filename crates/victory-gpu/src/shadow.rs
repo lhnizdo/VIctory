@@ -180,6 +180,20 @@ impl Shadow {
         format!("copy {:#x}+{:#x} {v:?}", self.start, self.len)
     }
 
+    /// Diagnostics: `n` dwords of the host copy from title address
+    /// `address`, if the copy holds them all.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn dwords(&self, address: u64, n: usize) -> Option<Vec<u32>> {
+        let at = address.checked_sub(self.start)? as usize;
+        if at + 4 * n > self.len as usize {
+            return None;
+        }
+        // SAFETY: inside the mapping (checked); racing GPU writes only make
+        // the values stale.
+        let v = unsafe { std::slice::from_raw_parts(self.data.add(at), 4 * n) };
+        Some(v.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.base
