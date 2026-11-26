@@ -134,10 +134,12 @@ pub(crate) fn opened(block: usize) {
     SKIPPED[block % SKIPPED.len()].store(0, Relaxed);
 }
 
+#[cfg(feature = "diagnostics")]
 /// Since the last report: faulting stores looked at, understood by the
 /// decoder, and of those, ones that would leave the memory as it is.
 pub(crate) static STORES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+#[cfg(feature = "diagnostics")]
 /// Whether faulting stores are counted (`VICTORY_STORE_STATS=1`).
 pub(crate) fn stats_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -171,6 +173,7 @@ pub(crate) fn count(context: &CONTEXT, at: usize) {
     }
 }
 
+#[cfg(feature = "diagnostics")]
 /// The counts since the last call (looked at, understood, leaving the
 /// memory as it is, stepped over, made beside the guards), and zeroes them.
 pub(crate) fn take() -> [u64; 5] {
