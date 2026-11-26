@@ -489,6 +489,18 @@ impl Shadow {
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
     pub(crate) fn copy_back_marked(&self, page: usize) -> usize {
+        let mut taken = Vec::new();
+        let written = self.copy_back_marked_into(page, &mut taken);
+        if let (Some(t), false) = (&self.tracked, taken.is_empty()) {
+            t.taken(&taken);
+        }
+        written
+    }
+
+    /// [`Shadow::copy_back_marked`], the page (number) pushed to `taken`
+    /// where it is now equal to title memory, for one [`crate::watch::Tracked::taken`]
+    /// over a copy's pages: one guard lock and a protection call per run.
+    pub(crate) fn copy_back_marked_into(&self, page: usize, taken: &mut Vec<usize>) -> usize {
         let Some(t) = &self.tracked else {
             return 0;
         };
@@ -542,7 +554,7 @@ impl Shadow {
         lap(3);
         // Equal to title memory now: taken, unless it holds the page in part.
         if from == page && to == page + PAGE {
-            t.taken(&[page / PAGE]);
+            taken.push(page / PAGE);
         }
         written.map_or(0, |_| n)
     }
@@ -968,6 +980,23 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         let m = marks();
         marked.iter().filter_map(|&n| page_of(&m, n)).collect()
     };
+    // `VICTORY_MARKED_BATCH=1`: each copy's pages taken at once.
+    static BATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let batch = *BATCH.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_MARKED_BATCH").is_some_and(|v| v == "1");
+        tracing::info!(on, "marked pages taken per copy at once (VICTORY_MARKED_BATCH)");
+        on
+    });
+    let mut taken: Vec<usize> = Vec::new();
+    let mut taking: Option<Arc<Shadow>> = None;
+    let flush = |copy: &Option<Arc<Shadow>>, taken: &mut Vec<usize>| {
+        if let Some(t) = copy.as_ref().and_then(|c| c.tracked.as_ref())
+            && !taken.is_empty()
+        {
+            t.taken(taken);
+        }
+        taken.clear();
+    };
     for (copy, page) in pages {
         if withheld
             .iter()
@@ -975,7 +1004,15 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         {
             continue;
         }
-        let written = copy.copy_back_marked(page);
+        let written = if batch {
+            if !taking.as_ref().is_some_and(|c| Arc::ptr_eq(c, &copy)) {
+                flush(&taking, &mut taken);
+                taking = Some(copy.clone());
+            }
+            copy.copy_back_marked_into(page, &mut taken)
+        } else {
+            copy.copy_back_marked(page)
+        };
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(crate::copystat::C::MarkedPages, 1);
@@ -984,6 +1021,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         #[cfg(not(feature = "diagnostics"))]
         let _ = written;
     }
+    flush(&taking, &mut taken);
 }
 
 struct Entry {
