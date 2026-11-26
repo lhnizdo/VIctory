@@ -3161,6 +3161,14 @@ impl Meter {
             tracing::info!(
                 "copying back by part, ms/frame: checks and ranges {checks:.1}, marked pages                  {marks:.1}, read views made {views:.1}, compares and copies {compares:.1},                  work after {after:.1}"
             );
+            #[cfg(feature = "diagnostics")]
+            if crate::titlewrite::stats_on() {
+                let [looked, understood, same, stepped] =
+                    crate::titlewrite::take().map(|n| n as f64 / report_frames);
+                tracing::info!(
+                    "faulting stores per frame: {looked:.0}, {understood:.0} understood, {same:.0} of them leaving the memory as it is, {stepped:.0} stepped over"
+                );
+            }
             let m = crate::shadow::MARKED_PARTS.each_ref().map(|a| a.swap(0, Ordering::Relaxed) as f64);
             tracing::info!(
                 "marked pages, per frame: {:.0} went back changed, {:.0} equal, {:.0} kept the                  title's; ms unarming {:.1}, reading the title {:.1}, comparing {:.1}, writing {:.1}",

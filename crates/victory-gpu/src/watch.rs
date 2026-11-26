@@ -713,6 +713,9 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
 /// guarded.
 fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     let guarded = g.protected.range(first..last).next().is_some();
+    for block in first..last {
+        crate::titlewrite::opened(block);
+    }
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     #[cfg(feature = "diagnostics")]
     {
@@ -905,6 +908,27 @@ fn install() {
         let at = r.ExceptionInformation[1];
         #[cfg(feature = "diagnostics")]
         let _timed = Timed(std::time::Instant::now(), crate::copystat::C::HandlerUs);
+        #[cfg(feature = "diagnostics")]
+        if crate::titlewrite::stats_on() {
+            // SAFETY: the system passes the faulting thread's context.
+            crate::titlewrite::count(unsafe { &*(*info).ContextRecord }, at);
+        }
+        // A store that leaves the memory as it is, into a block of ours:
+        // stepped over (`crate::titlewrite::unchanged`).
+        if crate::titlewrite::skip_same_on() {
+            // SAFETY: the system passes the faulting thread's context, which
+            // it resumes from.
+            let context = unsafe { &mut *(*info).ContextRecord };
+            if let Some((len, flags)) = crate::titlewrite::unchanged(context, at) {
+                let ours = guards().protected.contains(&(at / PAGE));
+                if ours && crate::titlewrite::may_skip(at / PAGE) {
+                    context.Rip += len as u64;
+                    context.EFlags = flags;
+                    crate::titlewrite::STEPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+        }
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).

@@ -1390,6 +1390,36 @@ pub(crate) mod tests {
     /// submission declared as written by shaders: the refresh before the
     /// submission runs still brings it to the copy, a shader's write still
     /// goes back, and a title write made after the refresh is not undone.
+    /// With stores that leave the memory as it is stepped over
+    /// (`crate::titlewrite::unchanged`): a guarded block's store of what it
+    /// holds leaves it guarded and its copy clean; a store of something else
+    /// opens it, as before, and lands.
+    #[test]
+    fn a_store_of_what_a_guarded_block_holds_is_stepped_over() {
+        let p = crate::watch::tests::pool(1);
+        let len = PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        copy.update(p, len);
+        assert!(copy.clean(), "taken");
+        crate::titlewrite::SKIP_IN_TEST.set(true);
+        let word = (p + 100) as *mut u32;
+        // SAFETY: (writes and reads below) a dword of our pool, which holds 0.
+        unsafe { word.write_volatile(0) };
+        let same_clean = copy.clean();
+        // SAFETY: as above.
+        unsafe { word.write_volatile(7) };
+        crate::titlewrite::SKIP_IN_TEST.set(false);
+        assert!(same_clean, "a store of what was there opened the block");
+        assert!(!copy.clean(), "a store of something else did not open it");
+        // SAFETY: as above.
+        assert_eq!(unsafe { word.read_volatile() }, 7, "the second store landed");
+        unregister(p, p as u64);
+    }
+
     #[test]
     fn title_writes_under_a_busy_range_are_copied() {
         let p = crate::watch::tests::pool(2);

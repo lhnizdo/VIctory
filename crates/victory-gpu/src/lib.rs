@@ -66,6 +66,8 @@ mod texture;
 mod twin;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod titlewrite;
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use copystat::CountingAlloc;
