@@ -1145,8 +1145,16 @@ fn store_beside(context: &mut windows_sys::Win32::System::Diagnostics::Debug::CO
     let Some(&ours) = views.get(&page) else {
         return false;
     };
+    let rip = context.Rip as usize;
+    if !crate::titlewrite::sparse_site(rip) {
+        return false;
+    }
     let mut g = guards_pages(&[page], false);
-    if !g.is_protected(page) || !crate::titlewrite::may_skip(page, crate::titlewrite::A_STORE) {
+    if !g.is_protected(page) {
+        return false;
+    }
+    if !crate::titlewrite::may_skip(page, crate::titlewrite::A_STORE) {
+        crate::titlewrite::site_stored(rip, true);
         return false;
     }
     let others: Vec<usize> = g.alias_of.get(&page).cloned().unwrap_or_default();
@@ -1160,6 +1168,7 @@ fn store_beside(context: &mut windows_sys::Win32::System::Diagnostics::Debug::CO
         return false;
     }
     context.Rip += store.len() as u64;
+    crate::titlewrite::site_stored(rip, false);
     crate::titlewrite::BESIDE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     true
 }

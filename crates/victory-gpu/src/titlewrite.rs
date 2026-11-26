@@ -100,8 +100,44 @@ thread_local! {
 /// so every next store into it faults again, and a block taking many is
 /// cheaper opened once (avatarmanz's weights).
 pub(crate) const MOST: u32 = 32;
-/// What a store made beside the guard takes of [`MOST`] (4 a block).
-pub(crate) const A_STORE: u32 = 8;
+/// What a store made beside the guard takes of [`MOST`] (32 a block): a
+/// cheap fault is ~12 us, an opening ~420 us (the kernel's protection
+/// change, world, RTX 2080 PC), so a block taking up to ~35 stores beside
+/// its guard is cheaper than opening it, if code that fills blocks opens
+/// them at once ([`sparse_site`]).
+pub(crate) const A_STORE: u32 = 1;
+
+/// Places of the title's code whose stores faulted, by a hash of the
+/// address: stores made beside the guards (low half) and blocks that took
+/// their whole share under it (high half). avatarmanz's `SITES`.
+static SITES: [AtomicU64; 1 << 10] = [const { AtomicU64::new(0) }; 1 << 10];
+
+fn site(rip: usize) -> &'static AtomicU64 {
+    &SITES[(rip as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) as usize >> 54 & 1023]
+}
+
+/// Whether the code at `rip` stores about one word a block, as far as is
+/// known (then its stores go beside the guards; code filling blocks opens
+/// them at its first store).
+pub(crate) fn sparse_site(rip: usize) -> bool {
+    let counts = site(rip).load(Relaxed);
+    let (done, full) = (counts & 0xffff_ffff, counts >> 32);
+    full < 4 || full * 12 < done
+}
+
+/// A store at `rip` was made beside the guard (`full`: its block had taken
+/// its share instead, and opens).
+pub(crate) fn site_stored(rip: usize, full: bool) {
+    let s = site(rip);
+    if full {
+        // Looked at anew some time (a site may change what it writes).
+        if s.fetch_add(1 << 32, Relaxed) >> 32 > 4096 {
+            s.store(0, Relaxed);
+        }
+    } else {
+        s.fetch_add(1, Relaxed);
+    }
+}
 
 /// Stores stepped over, by a few bits of the block's number (blocks sharing
 /// a slot share its count: they are opened a little sooner).
