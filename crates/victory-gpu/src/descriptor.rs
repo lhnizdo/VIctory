@@ -124,6 +124,17 @@ const SHADER_VISIBLE: u32 = 1;
 #[cfg(windows)]
 static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
 
+/// Whether `address` lies in a shader-visible descriptor heap's title
+/// memory (diagnostics: what the title's faulting writes hit).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn in_shader_heap(address: u64) -> bool {
+    SHADER_HEAPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|&(start, end, _)| (start..end).contains(&address))
+}
+
 /// Makes the host descriptor for what the title wrote at `handle`, if it
 /// is in a shader-visible heap. Keeps `SHADER_HEAPS` locked for the duration
 /// so `Heap::drop` cannot free the heap concurrently.

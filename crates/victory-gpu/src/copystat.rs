@@ -216,7 +216,7 @@ pub(crate) fn page_faults() -> u64 {
 /// Guard faults by the address of the instruction that wrote, since the last
 /// report (`VICTORY_FAULT_SITES=1`): where the title's writes into guarded
 /// blocks come from (its `memcpy` and `memset`, single stores).
-static FAULT_SITES: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+static FAULT_SITES: Mutex<Option<HashMap<usize, (u64, usize)>>> = Mutex::new(None);
 
 /// Whether fault sites are counted (`VICTORY_FAULT_SITES=1`).
 pub(crate) fn fault_sites_on() -> bool {
@@ -224,10 +224,23 @@ pub(crate) fn fault_sites_on() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_FAULT_SITES").is_ok_and(|v| v == "1"))
 }
 
-/// Counts a guard fault at instruction address `rip`.
-pub(crate) fn fault_site(rip: usize) {
+/// Counts a guard fault at instruction address `rip`, writing `at`.
+pub(crate) fn fault_site(rip: usize, at: usize) {
     let mut m = FAULT_SITES.lock().unwrap_or_else(|e| e.into_inner());
-    *m.get_or_insert_with(HashMap::new).entry(rip).or_insert(0) += 1;
+    let e = m.get_or_insert_with(HashMap::new).entry(rip).or_insert((0, 0));
+    *e = (e.0 + 1, at);
+}
+
+/// What title memory at `at` is: a shader-visible descriptor heap, memory a
+/// buffer's host copy covers, or neither.
+fn kind_of(at: usize) -> &'static str {
+    if crate::descriptor::in_shader_heap(at as u64) {
+        "heap"
+    } else if crate::shadow::find(at as u64, 1).is_some() {
+        "buffer"
+    } else {
+        "other"
+    }
 }
 
 /// The module holding `at` and `at`'s offset in it, as `name+0xoffset`.
@@ -262,24 +275,33 @@ fn log_fault_sites(frames: f64) {
     let Some(m) = FAULT_SITES.lock().unwrap_or_else(|e| e.into_inner()).take() else {
         return;
     };
-    let total: u64 = m.values().sum();
-    let mut sites: Vec<(usize, u64)> = m.into_iter().collect();
-    sites.sort_unstable_by_key(|&(_, n)| std::cmp::Reverse(n));
+    let total: u64 = m.values().map(|v| v.0).sum();
+    // Per frame by kind of memory written, over every site.
+    let mut kinds: HashMap<&'static str, u64> = HashMap::new();
+    for &(n, at) in m.values() {
+        *kinds.entry(kind_of(at)).or_insert(0) += n;
+    }
+    let mut kinds: Vec<(&'static str, u64)> = kinds.into_iter().collect();
+    kinds.sort_unstable_by_key(|&(_, n)| std::cmp::Reverse(n));
+    let kinds: Vec<String> = kinds.iter().map(|&(k, n)| format!("{k} {:.1}", n as f64 / frames)).collect();
+    let mut sites: Vec<(usize, (u64, usize))> = m.into_iter().collect();
+    sites.sort_unstable_by_key(|&(_, (n, _))| std::cmp::Reverse(n));
     let top: Vec<String> = sites
         .iter()
         .take(12)
-        .map(|&(rip, n)| {
+        .map(|&(rip, (n, wrote))| {
             #[cfg(windows)]
             let at = module_offset(rip);
             #[cfg(not(windows))]
             let at = format!("{rip:#x}");
-            format!("{at} {:.1}", n as f64 / frames)
+            format!("{at} {:.1} ({})", n as f64 / frames, kind_of(wrote))
         })
         .collect();
     tracing::info!(
-        "guard faults per frame by site: {:.1} at {} sites; {}",
+        "guard faults per frame by site: {:.1} at {} sites (by memory: {}); {}",
         total as f64 / frames,
         sites.len(),
+        kinds.join(", "),
         top.join(", ")
     );
 }

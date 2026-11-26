@@ -915,7 +915,7 @@ fn install() {
             #[cfg(feature = "diagnostics")]
             if crate::copystat::fault_sites_on() {
                 // SAFETY: the system passes the faulting thread's context.
-                crate::copystat::fault_site(unsafe { (*(*info).ContextRecord).Rip } as usize);
+                crate::copystat::fault_site(unsafe { (*(*info).ContextRecord).Rip } as usize, at);
             }
             return EXCEPTION_CONTINUE_EXECUTION;
         }
