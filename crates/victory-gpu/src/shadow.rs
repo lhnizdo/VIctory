@@ -497,12 +497,21 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut lap_at = std::time::Instant::now();
+        let mut lap = |part: usize| {
+            let now = std::time::Instant::now();
+            MARKED_PARTS[part].fetch_add((now - lap_at).as_micros() as u64, Relaxed);
+            lap_at = now;
+        };
         // Our own write below must not save the page for this copy again.
         t.unarm(page / PAGE);
         let saved = t.saved(page / PAGE);
+        lap(0);
         if saved.is_none() && t.changed(page / PAGE) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::MarkedKept, 1);
+            MARKED_PARTS[6].fetch_add(1, Relaxed);
             return 0;
         }
         let n = to - from;
@@ -512,6 +521,7 @@ impl Shadow {
         if !crate::host::read_into(from as *const u8, &mut title) {
             return 0;
         }
+        lap(1);
         let written = match &saved {
             // The title's bytes are the copy's from before: what differs is
             // the shaders'.
@@ -521,10 +531,15 @@ impl Shadow {
                 merge_writeback(&mut title, host, before).then_some(title.as_ptr())
             }
         };
+        lap(2);
         if let Some(bytes) = written {
             let _writing = crate::watch::writing(from, n);
             crate::host::write_mapped(from as *mut u8, bytes, n);
+            MARKED_PARTS[4].fetch_add(1, Relaxed);
+        } else {
+            MARKED_PARTS[5].fetch_add(1, Relaxed);
         }
+        lap(3);
         // Equal to title memory now: taken, unless it holds the page in part.
         if from == page && to == page + PAGE {
             t.taken(&[page / PAGE]);
@@ -897,6 +912,13 @@ pub(crate) fn forget_read(slot: u32) {
 // shortcut: marks do not tell lists apart: a page that a withheld list and
 // another both wrote through views goes back unless the withheld list
 // declared it.
+/// Of the marked pages' copy-back ([`Shadow::copy_back_marked`]),
+/// microseconds by step: unarming and the saved bytes, reading the title's
+/// page, comparing (and merging), writing it back; and the pages that went
+/// back changed, equal, and kept the title's.
+pub(crate) static MARKED_PARTS: [std::sync::atomic::AtomicU64; 7] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
 pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {
     let (mut marked, mut held) = (Vec::new(), Vec::new());
     for memory in [false, true] {

@@ -3161,6 +3161,17 @@ impl Meter {
             tracing::info!(
                 "copying back by part, ms/frame: checks and ranges {checks:.1}, marked pages                  {marks:.1}, read views made {views:.1}, compares and copies {compares:.1},                  work after {after:.1}"
             );
+            let m = crate::shadow::MARKED_PARTS.each_ref().map(|a| a.swap(0, Ordering::Relaxed) as f64);
+            tracing::info!(
+                "marked pages, per frame: {:.0} went back changed, {:.0} equal, {:.0} kept the                  title's; ms unarming {:.1}, reading the title {:.1}, comparing {:.1}, writing {:.1}",
+                m[4] / report_frames,
+                m[5] / report_frames,
+                m[6] / report_frames,
+                m[0] / 1e3 / report_frames,
+                m[1] / 1e3 / report_frames,
+                m[2] / 1e3 / report_frames,
+                m[3] / 1e3 / report_frames,
+            );
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (heaps, heap_used, heap_free) = crate::placement::stats();
             tracing::info!(
