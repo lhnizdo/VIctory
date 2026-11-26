@@ -367,6 +367,25 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                                 if !lock(&seen).insert(hash) {
                                     continue;
                                 }
+                                // Local diagnostics: `VICTORY_PICK=<16 hex>` and
+                                // `VICTORY_PICK_DIR` (outside the repo) keep that one
+                                // container and translate nothing.
+                                if let Ok(pick) = std::env::var("VICTORY_PICK") {
+                                    let name = &hash.to_hex()[..16];
+                                    // `all`: compute containers (their `CS_` entry names).
+                                    let all = pick == "all"
+                                        && container.windows(3).any(|w| w == b"CS_");
+                                    if all || name == pick {
+                                        let dir =
+                                            std::env::var("VICTORY_PICK_DIR").unwrap_or_default();
+                                        let _ =
+                                            std::fs::write(format!("{dir}/{name}.bin"), container);
+                                        if !all {
+                                            eprintln!("picked {pick} ({} bytes)", container.len());
+                                        }
+                                    }
+                                    continue;
+                                }
                                 let one = std::time::Instant::now();
                                 let (done, cached) =
                                     victory_gpu::shader_cache::host_shader(container);

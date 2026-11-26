@@ -15,7 +15,7 @@ use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_ST
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
-use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, Value};
+use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, VCC, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER_DATA};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
@@ -113,12 +113,34 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 /// [`lower`] for a host that runs 64-lane waves (`host_wave64`) or not: a
 /// wave64 compute program that needs the console's lanes then splits each
 /// console wave into two host waves of 32 (see [`wave64`]).
+#[cfg(test)]
+pub(crate) static NO_CONSOLE_RETRY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Tests: lowerings that ran as the console runs them (the retry), and a
+/// switch that leaves [`Lower::made_of_scalars`] out (a census compares).
+#[cfg(test)]
+pub(crate) static CONSOLE_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static NO_FIRST_OWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) fn lower_for(parts: &Parts, host_wave64: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    // Tests: the split's own refusal, without the console-mode retry.
+    #[cfg(test)]
+    let no_retry = NO_CONSOLE_RETRY.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(test))]
+    let no_retry = false;
     let mut console = false;
     loop {
         match Lower::new(parts, &bad, host_wave64, console).run() {
-            Ok(l) => return Ok(l),
+            Ok(l) => {
+                #[cfg(test)]
+                if console {
+                    CONSOLE_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return Ok(l);
+            }
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
                     return Err(ShaderError::Unsupported {
@@ -131,6 +153,7 @@ pub(crate) fn lower_for(parts: &Parts, host_wave64: bool) -> Result<Lowered, Sha
             // again, as the console runs it (`Lower::split_console`).
             Err(Stop::Fail(ShaderError::Unsupported { what, .. }))
                 if !console
+                    && !no_retry
                     && !host_wave64
                     && (what == wave64::NOT_EVERY_THREAD || what == wave64::LDS_LOCKSTEP)
                     && one_console_wave(parts) =>
@@ -351,6 +374,10 @@ struct Lower<'a> {
     /// same blocks the same number of times, so the split's exchanges may be
     /// anywhere ([`lower_for`] retries so where the split refused).
     split_console: bool,
+    /// The `v_readfirstlane_b32` being lowered reads a value every lane
+    /// active there computed alike ([`Lower::made_of_scalars`]): the lane's
+    /// own, with no exchange between the halves of a split.
+    first_is_own: bool,
 }
 
 /// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
@@ -804,6 +831,7 @@ impl<'a> Lower<'a> {
             split,
             split_refusal,
             split_console,
+            first_is_own: false,
         }
     }
 
@@ -5956,9 +5984,151 @@ impl<'a> Lower<'a> {
             };
             self.src0 = Some(x);
         }
+        self.first_is_own =
+            name == "v_readfirstlane_b32" && self.split.is_some() && self.made_of_scalars(b, i);
+        #[cfg(test)]
+        if NO_FIRST_OWN.load(std::sync::atomic::Ordering::Relaxed) {
+            self.first_is_own = false;
+        }
         let r = self.valu_op(inst, guard);
         self.src0 = None;
+        self.first_is_own = false;
         r
+    }
+
+    /// Whether the VGPR that instruction `i` of IR block `b` reads first was
+    /// made by lane-wise arithmetic, selects and compares of scalars and
+    /// constants only (a `v_sub_f32 v, s, s` of a spilled scalar, say), each
+    /// step either earlier in that block with no write of EXEC in between,
+    /// or unguarded in a block dominating it: every lane active at `i` then
+    /// computed the same value. Phis, inputs and other instructions count as
+    /// lane-dependent.
+    fn made_of_scalars(&self, b: usize, i: usize) -> bool {
+        self.why_not_scalars(b, i).is_none()
+    }
+
+    fn why_not_scalars(&self, b: usize, i: usize) -> Option<String> {
+        let p = self.x.p;
+        let insts = &p.blocks[b].insts;
+        let Fields::Valu(v) = &insts[i].fields else {
+            return Some("not a VALU".into());
+        };
+        let Some(&Operand::Vector { reg, dwords: 1 }) = v.src.first() else {
+            return Some("source not one VGPR".into());
+        };
+        let Some(first) = insts[i].read(Reg::V(reg)) else {
+            return Some("no read".into());
+        };
+        let order = crate::ir::reverse_postorder(&p.blocks);
+        let mut index = vec![usize::MAX; p.blocks.len()];
+        for (n, &k) in order.iter().enumerate() {
+            index[k] = n;
+        }
+        let idom = crate::ir::idoms(&p.blocks, &order, &index);
+        let dominates = |d: usize, mut k: usize| loop {
+            if k == d {
+                break true;
+            }
+            if k == usize::MAX || idom[k] == k {
+                break false;
+            }
+            k = idom[k];
+        };
+        let exec_written = |k: usize, from: usize, to: usize| {
+            p.blocks[k].insts[from..to].iter().any(|w| {
+                w.writes
+                    .iter()
+                    .any(|x| matches!(x.0, Reg::S(c) if c == EXEC || c == EXEC + 1))
+            })
+        };
+        let mut want = vec![first];
+        let mut seen = HashSet::new();
+        while let Some(x) = want.pop() {
+            if !seen.insert(x) {
+                continue;
+            }
+            let Some((db, di, w)) = self.def_site(x) else {
+                return Some(format!("{x:?} is a phi or an input"));
+            };
+            let unguarded = self.x.st.guards[db][di].is_none();
+            let placed = if db == b {
+                di < i && (unguarded || !exec_written(b, di + 1, i))
+            } else {
+                unguarded && dominates(db, b)
+            };
+            if !placed {
+                return Some(format!(
+                    "{} at {:#x} (block {db}) not reaching every lane",
+                    w.name(),
+                    w.machine.offset
+                ));
+            }
+            let Fields::Valu(wv) = &w.fields else {
+                return Some(format!(
+                    "made by non-VALU {} at {:#x}",
+                    w.name(),
+                    w.machine.offset
+                ));
+            };
+            let name = w.name();
+            let select = name == "v_cndmask_b32";
+            // A compare of 32-bit values writes the mask a select reads.
+            let compare = name.starts_with("v_cmp_")
+                && !["f16", "f64", "u64", "i64", "u16", "i16"]
+                    .iter()
+                    .any(|t| name.ends_with(t));
+            if !(lanewise(name) || select || compare)
+                || wv.dpp.is_some()
+                || wv.sdwa.is_some()
+                || wv.carry.is_some()
+            {
+                return Some(format!("made by {name} at {:#x}", w.machine.offset));
+            }
+            let dst_ok = if compare {
+                matches!(wv.dst, Some(Operand::Scalar { dwords: 2, .. })) && w.writes.len() == 2
+            } else {
+                matches!(wv.dst, Some(Operand::Vector { dwords: 1, .. })) && w.writes.len() == 1
+            };
+            if !dst_ok {
+                return Some(format!(
+                    "{name} at {:#x} writes {:?}",
+                    w.machine.offset, w.writes
+                ));
+            }
+            // `v_fmac`/`v_mac` add to their destination's old value.
+            let acc = match (name, wv.dst) {
+                ("v_fmac_f32" | "v_mac_f32", Some(d)) => Some(d),
+                _ => None,
+            };
+            for (k, op) in wv.src.iter().chain(acc.iter()).enumerate() {
+                match *op {
+                    // A select's mask: the low dword's value, made by a compare.
+                    Operand::Scalar { code, dwords: 2 } if select && k == 2 && code < EXEC => {
+                        match w.read(Reg::S(code)) {
+                            Some(m) => want.push(m),
+                            None => {
+                                return Some(format!(
+                                    "no read of s{code} at {:#x}",
+                                    w.machine.offset
+                                ));
+                            }
+                        }
+                    }
+                    Operand::Scalar { code, .. }
+                        if code != VCC && code != VCC + 1 && code < EXEC => {}
+                    Operand::Const(c) if c < 251 => {}
+                    Operand::Literal(_) => {}
+                    Operand::Vector { reg, dwords: 1 } => match w.read(Reg::V(reg)) {
+                        Some(m) => want.push(m),
+                        None => {
+                            return Some(format!("no read of v{reg} at {:#x}", w.machine.offset));
+                        }
+                    },
+                    ref o => return Some(format!("{name} at {:#x} reads {o:?}", w.machine.offset)),
+                }
+            }
+        }
+        None
     }
 
     /// DPP: src0 as read from another lane, and which lanes write their
@@ -6819,6 +6989,11 @@ impl<'a> Lower<'a> {
                     .is_some_and(|w| self.x.res.waterfall.reads.contains(&w.1)) =>
             {
                 // A waterfall loop's read of a descriptor dword: the lane's own.
+                let a = s(self, 0)?;
+                int(self, a)
+            }
+            // Every lane active here holds the same value (`made_of_scalars`).
+            "v_readfirstlane_b32" if self.first_is_own => {
                 let a = s(self, 0)?;
                 int(self, a)
             }
@@ -10622,6 +10797,68 @@ impl<'a> Lower<'a> {
 }
 
 /// Whether `i` is an LDS memory instruction (not a cross-lane swizzle or permute).
+/// 32-bit VALU operations whose result in a lane depends only on that
+/// lane's sources (no lane masks, carries, lane indices or other lanes).
+fn lanewise(name: &str) -> bool {
+    const OPS: &[&str] = &[
+        "v_mov_b32",
+        "v_add_f32",
+        "v_sub_f32",
+        "v_subrev_f32",
+        "v_mul_f32",
+        "v_mul_legacy_f32",
+        "v_fma_f32",
+        "v_fmac_f32",
+        "v_fmaak_f32",
+        "v_fmamk_f32",
+        "v_mac_f32",
+        "v_mad_f32",
+        "v_min_f32",
+        "v_max_f32",
+        "v_min3_f32",
+        "v_max3_f32",
+        "v_med3_f32",
+        "v_rcp_f32",
+        "v_rcp_iflag_f32",
+        "v_rsq_f32",
+        "v_sqrt_f32",
+        "v_exp_f32",
+        "v_log_f32",
+        "v_floor_f32",
+        "v_ceil_f32",
+        "v_trunc_f32",
+        "v_rndne_f32",
+        "v_fract_f32",
+        "v_sin_f32",
+        "v_cos_f32",
+        "v_cvt_f32_u32",
+        "v_cvt_f32_i32",
+        "v_cvt_u32_f32",
+        "v_cvt_i32_f32",
+        "v_add_nc_u32",
+        "v_sub_nc_u32",
+        "v_subrev_nc_u32",
+        "v_mul_lo_u32",
+        "v_mul_hi_u32",
+        "v_mul_u32_u24",
+        "v_and_b32",
+        "v_or_b32",
+        "v_xor_b32",
+        "v_not_b32",
+        "v_lshlrev_b32",
+        "v_lshrrev_b32",
+        "v_ashrrev_i32",
+        "v_bfe_u32",
+        "v_bfe_i32",
+        "v_bfi_b32",
+        "v_min_u32",
+        "v_max_u32",
+        "v_min_i32",
+        "v_max_i32",
+    ];
+    OPS.contains(&name)
+}
+
 fn is_lds_mem(i: &Inst) -> bool {
     let n = i.name();
     matches!(i.fields, Fields::Ds { .. }) && !n.starts_with("ds_swizzle") && !n.contains("permute")
