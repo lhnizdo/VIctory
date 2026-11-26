@@ -1279,14 +1279,22 @@ fn install() {
         let at = r.ExceptionInformation[1];
         #[cfg(feature = "diagnostics")]
         let _timed = Timed(std::time::Instant::now(), crate::copystat::C::HandlerUs);
+        // Only a block of ours is read below: any other fault (the title's
+        // own, at a null pointer, say, which it may handle) is left to its
+        // handlers untouched.
         #[cfg(feature = "diagnostics")]
-        if crate::titlewrite::stats_on() {
+        let asked = crate::titlewrite::skip_same_on() || crate::titlewrite::stats_on();
+        #[cfg(not(feature = "diagnostics"))]
+        let asked = crate::titlewrite::skip_same_on();
+        let guarded = asked && guards_pages(&[at / PAGE], false).is_protected(at / PAGE);
+        #[cfg(feature = "diagnostics")]
+        if guarded && crate::titlewrite::stats_on() {
             // SAFETY: the system passes the faulting thread's context.
             crate::titlewrite::count(unsafe { &*(*info).ContextRecord }, at);
         }
         // A store that leaves the memory as it is, into a block of ours:
         // stepped over (`crate::titlewrite::unchanged`).
-        if crate::titlewrite::skip_same_on() {
+        if guarded && crate::titlewrite::skip_same_on() {
             // SAFETY: the system passes the faulting thread's context, which
             // it resumes from.
             let context = unsafe { &mut *(*info).ContextRecord };
