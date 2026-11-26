@@ -227,6 +227,15 @@ pub(crate) fn begin(p: &Arc<Pending>) {
 
 /// Whether `p`'s host pipeline is made (`Some(true)`), refused or not
 /// translated (`Some(false)`), or not yet (`None`); never waits.
+/// Local diagnostics: the containers of `p` written to `dir` as
+/// `<hash>.bin` (the title's; outside every repo).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn dump(p: &Pending, dir: &str) {
+    for s in &p.shaders {
+        let _ = std::fs::write(format!("{dir}/{}.bin", s.hash), &s.container);
+    }
+}
+
 /// The shaders of `p`, as host pipelines are named (`stage hash`, joined).
 pub(crate) fn names(p: &Pending) -> String {
     p.shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect::<Vec<_>>().join(", ")

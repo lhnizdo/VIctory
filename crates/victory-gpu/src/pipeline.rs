@@ -277,7 +277,14 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
 /// ([`builder::runs`]).
 #[cfg(windows)]
 pub(crate) fn held_back(this: This) -> bool {
-    !this.is_null() && pipeline(this).builder && !builder::runs()
+    if this.is_null() || !pipeline(this).builder {
+        return false;
+    }
+    #[cfg(feature = "diagnostics")]
+    if builder::dropped_by_env(&shaders_of(this)) {
+        return true;
+    }
+    !builder::runs()
 }
 
 /// A title DLL was mapped at `base`, `size` bytes (the acceleration-

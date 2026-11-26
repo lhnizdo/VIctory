@@ -83,11 +83,30 @@ static PIPELINES: Mutex<Vec<Weak<Pending>>> = Mutex::new(Vec::new());
 /// The builder created pipeline `p`: it counts towards [`runs`], and is
 /// made at once (no frame's wait budget holds it back).
 pub(crate) fn note(p: &Arc<Pending>) {
+    // Local diagnostics: every builder container kept, for offline reading.
+    #[cfg(feature = "diagnostics")]
+    if let Ok(dir) = std::env::var("VICTORY_DUMP_BUILDER_DIR") {
+        make::dump(p, &dir);
+    }
     PIPELINES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(Arc::downgrade(p));
     make::begin(p);
+}
+
+/// Local diagnostics, `VICTORY_BUILDER_DROP=<hash>,...`: dispatches of the
+/// builder's pipelines with one of those shaders are dropped while the rest
+/// of the builder runs (the gate stays open): which program hangs.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn dropped_by_env(shaders: &str) -> bool {
+    static WANT: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let want = WANT.get_or_init(|| {
+        std::env::var("VICTORY_BUILDER_DROP")
+            .map(|v| v.split(',').map(|h| h.trim().to_owned()).filter(|h| !h.is_empty()).collect())
+            .unwrap_or_default()
+    });
+    !want.is_empty() && want.iter().any(|h| shaders.contains(h.as_str()))
 }
 
 /// The frame [`runs`] last decided for, and its decision.
