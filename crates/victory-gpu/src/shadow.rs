@@ -529,8 +529,17 @@ impl Shadow {
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
+        // One buffer per thread for the title's page, not a fresh zeroed
+        // 64 KiB per page (its fresh pages fault; ~12,000 marked pages a
+        // world frame).
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let mut title = TITLE.with(|t| std::mem::take(&mut *t.borrow_mut()));
+        title.resize(n, 0);
+        let give_back = |title: Vec<u8>| TITLE.with(|t| *t.borrow_mut() = title);
         if !crate::host::read_into(from as *const u8, &mut title) {
+            give_back(title);
             return 0;
         }
         lap(1);
@@ -552,6 +561,7 @@ impl Shadow {
             MARKED_PARTS[5].fetch_add(1, Relaxed);
         }
         lap(3);
+        give_back(title);
         // Equal to title memory now: taken, unless it holds the page in part.
         if from == page && to == page + PAGE {
             taken.push(page / PAGE);
