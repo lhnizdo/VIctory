@@ -23,7 +23,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
 /// (`VICTORY_STORE_BESIDE=1`; [`crate::watch::title_memory_beside`]).
 pub(crate) fn beside_on() -> bool {
     #[cfg(test)]
-    if BESIDE_IN_TEST.get() {
+    if BESIDE_IN_TEST.with(|on| on.load(std::sync::atomic::Ordering::SeqCst)) {
         return true;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -33,7 +33,8 @@ pub(crate) fn beside_on() -> bool {
 #[cfg(test)]
 thread_local! {
     /// [`beside_on`] for this thread's faults.
-    pub(crate) static BESIDE_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // The exception handler observes this between two ordinary test instructions.
+    pub(crate) static BESIDE_IN_TEST: std::sync::atomic::AtomicBool = const { std::sync::atomic::AtomicBool::new(false) };
 }
 
 /// Stores made beside the guards since the last report.

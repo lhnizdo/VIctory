@@ -76,7 +76,7 @@ pub use host::{on_failure, set_caption_extra};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, title_memory_aliased, title_memory_beside, title_memory_beside_gone,
-    title_memory_remapped,
+    title_memory_remapped, tracked_memcpy, tracked_memset,
     writing as kernel_will_write,
 };
 

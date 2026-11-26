@@ -78,7 +78,20 @@ impl HostPolicy {
         if !self.allows(dll) {
             return None;
         }
-        imp::resolve(dll, symbol)
+        let host = imp::resolve(dll, symbol)?;
+        #[cfg(windows)]
+        if dll.eq_ignore_ascii_case("vcruntime140.dll") {
+            static COPY_BESIDE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(||
+                std::env::var("VICTORY_COPY_BESIDE").as_deref() == Ok("1"));
+            if *COPY_BESIDE && let ImportSymbol::Name { name, .. } = symbol {
+                match name.as_str() {
+                    "memcpy" => return Some(victory_gpu::tracked_memcpy as *const () as usize),
+                    "memset" => return Some(victory_gpu::tracked_memset as *const () as usize),
+                    _ => {}
+                }
+            }
+        }
+        Some(host)
     }
 }
 

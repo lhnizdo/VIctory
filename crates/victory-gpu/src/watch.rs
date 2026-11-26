@@ -1131,6 +1131,60 @@ pub fn title_memory_beside_gone(at: usize, len: usize) {
     }
 }
 
+/// One CRT destination chunk. Only redirect writes to a page we guarded.
+fn bulk_chunk(at: usize, write: impl FnOnce(*mut u8)) -> bool {
+    let page = at / PAGE;
+    let views = BESIDE_VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    let Some(&ours) = views.get(&page) else { return false };
+    let mut g = guards_pages(&[page], false);
+    if !g.is_protected(page) { return false }
+    let others = g.alias_of.get(&page).cloned().unwrap_or_default();
+    mark_changed(&mut g, page, page + 1, true);
+    for other in others {
+        mark_changed(&mut g, other, other + 1, true);
+    }
+    write((ours + at % PAGE) as *mut u8);
+    true
+}
+
+fn bulk_write(mut at: usize, len: usize, write: impl Fn(*mut u8, usize, usize)) {
+    let mut offset = 0;
+    while offset < len {
+        let count = (PAGE - at % PAGE).min(len - offset);
+        if !bulk_chunk(at, |dst| write(dst, offset, count)) {
+            // The ordinary write may fault. Release every tracker lock first.
+            write(at as *mut u8, offset, count);
+        }
+        offset += count;
+        at += count;
+    }
+}
+
+/// Title CRT memset with guard-aware section writes.
+/// # Safety
+/// The destination must be writable for len bytes under the title's mapping.
+pub unsafe extern "C" fn tracked_memset(dst: *mut u8, value: i32, len: usize) -> *mut u8 {
+    bulk_write(dst as usize, len, |out, _, count| unsafe {
+        std::ptr::write_bytes(out, value as u8, count);
+    });
+    dst
+}
+
+/// Title CRT memcpy with guard-aware section writes.
+/// # Safety
+/// Both ranges must be valid for the requested copy.
+pub unsafe extern "C" fn tracked_memcpy(dst: *mut u8, src: *const u8, len: usize) -> *mut u8 {
+    if len == 0 || dst.cast_const() == src { return dst }
+    if (dst as usize).abs_diff(src as usize) < len {
+        unsafe { std::ptr::copy(src, dst, len) };
+    } else {
+        bulk_write(dst as usize, len, |out, offset, count| unsafe {
+            std::ptr::copy(src.add(offset), out, count);
+        });
+    }
+    dst
+}
+
 /// A store that faulted at `at`, into a guarded block of ours showing a
 /// section: made through our view of its page, the block marked changed in
 /// every tracker (and its other views'), and left read-only (no change of
@@ -1854,10 +1908,10 @@ pub(crate) mod tests {
         let t = track(a, PAGE, true).expect("views are tracked");
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
         assert_eq!(protection(a), PAGE_READONLY, "taken");
-        crate::titlewrite::BESIDE_IN_TEST.set(true);
+        crate::titlewrite::BESIDE_IN_TEST.with(|on| on.store(true, std::sync::atomic::Ordering::SeqCst));
         // SAFETY: (writes and reads below) a dword of the title's view.
         unsafe { ((a + 100) as *mut u32).write_volatile(9) };
-        crate::titlewrite::BESIDE_IN_TEST.set(false);
+        crate::titlewrite::BESIDE_IN_TEST.with(|on| on.store(false, std::sync::atomic::Ordering::SeqCst));
         assert_eq!(protection(a), PAGE_READONLY, "the store opened the view");
         // SAFETY: as above, and the same page at the other mapping.
         let (here, there) = unsafe { (((a + 100) as *const u32).read_volatile(), ((b + 100) as *const u32).read_volatile()) };
@@ -1868,6 +1922,40 @@ pub(crate) mod tests {
         unsafe { ((a + 200) as *mut u32).write_volatile(3) };
         assert_ne!(protection(a), PAGE_READONLY, "opened as before");
         title_memory_beside_gone(a, PAGE);
+    }
+
+    #[test]
+    fn crt_writes_across_guarded_and_ordinary_pages() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        // SAFETY: two writable views of the same two-page section, released below.
+        unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE,
+                0, (2 * PAGE) as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let view = || MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * PAGE);
+            let (title, ours) = (view(), view());
+            let a = title.Value as usize;
+            assert!(a != 0 && !ours.Value.is_null());
+            title_memory_beside(a, ours.Value as usize);
+            let t = track(a, 2 * PAGE, true).unwrap();
+            t.take(a, a + 2 * PAGE);
+            let dst = (a + PAGE - 4) as *mut u8;
+            assert_eq!(tracked_memset(dst, 0x1ab, 8), dst);
+            assert_eq!(std::slice::from_raw_parts(dst, 8), &[0xab; 8]);
+            assert!(guards_pages(&[a / PAGE], false).is_protected(a / PAGE));
+            assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
+            let bytes = *b"12345678";
+            assert_eq!(tracked_memcpy(dst, bytes.as_ptr(), 8), dst);
+            assert_eq!(std::slice::from_raw_parts(dst, 8), &bytes);
+            assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
+            drop(t);
+            title_memory_beside_gone(a, 2 * PAGE);
+            UnmapViewOfFile(title);
+            UnmapViewOfFile(ours);
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
     }
 
     /// A write through another mapping of the same pages marks the tracker
