@@ -3212,12 +3212,15 @@ impl Meter {
         // indirect ones the host could not prepare.
         let extra = CAPTION_EXTRA.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let (dropped, indirect) = self.last_dropped;
+        // Pipelines made of those asked for (a draw needed them or an early
+        // start), and how many the title created so far.
+        let (created, asked, made) = crate::pipeline::counts();
         // Running time since the first present (about the launch).
         let up = self.started.elapsed().as_secs();
         let (h, m, s) = (up / 3600, up / 60 % 60, up % 60);
         let text = format!(
             " | VIctory {h}:{m:02}:{s:02} frame {number} | {fps:.1} fps {ms:.0} ms/frame | {draws:.0} draws, \
-             dropped {dropped:.0} + {indirect:.0} indirect{}{extra}",
+             dropped {dropped:.0} + {indirect:.0} indirect | pipelines {made}/{asked}, {created} created{}{extra}",
             if extra.is_empty() { "" } else { " | " }
         );
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();

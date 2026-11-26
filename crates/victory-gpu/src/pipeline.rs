@@ -262,6 +262,12 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Pipelines the title created, asked for, and made so far.
+#[cfg(windows)]
+pub(crate) fn counts() -> (u64, u64, u64) {
+    make::counts()
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]

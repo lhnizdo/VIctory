@@ -188,6 +188,19 @@ pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
 }
 
+/// Pipelines ever queued (a draw or an early start asked for them).
+static ASKED: AtomicU64 = AtomicU64::new(0);
+/// Pipelines the title created.
+static CREATED: AtomicU64 = AtomicU64::new(0);
+
+/// Pipelines the title created, asked for, and made so far (diagnostics:
+/// the window caption).
+pub(crate) fn counts() -> (u64, u64, u64) {
+    let asked = ASKED.load(Ordering::Relaxed);
+    let made = asked.saturating_sub(WAITING.load(Ordering::Relaxed));
+    (CREATED.load(Ordering::Relaxed), asked, made)
+}
+
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
@@ -217,6 +230,7 @@ fn start(p: &Arc<Pending>, now: bool) {
 fn enqueue(p: &Pending, now: bool) -> Option<bool> {
     let first = !p.queued.swap(true, Ordering::Relaxed);
     if first {
+        ASKED.fetch_add(1, Ordering::Relaxed);
         PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
     }
     let ahead = now && !p.now.swap(true, Ordering::Relaxed);
@@ -226,6 +240,7 @@ fn enqueue(p: &Pending, now: bool) -> Option<bool> {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
+    CREATED.fetch_add(1, Ordering::Relaxed);
     super::library::note_created(&p.key);
     if p.made.get().is_none() && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
