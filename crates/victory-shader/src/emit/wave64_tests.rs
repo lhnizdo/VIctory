@@ -860,3 +860,78 @@ fn lds_in_one_wave64_wave_of_more_than_32_threads_is_refused() {
     lower_cs(&w, 32, 512, false).expect("one host wave");
     lower_cs(&w, 128, 512, false).expect("two console waves");
 }
+
+/// DS `ds_swizzle_b32 vdst, addr offset:<offset>`.
+const fn ds_swizzle_b32(vdst: u8, addr: u8, offset: u16) -> [u32; 2] {
+    [0x36 << 26 | 0x35 << 18 | offset as u32, (vdst as u32) << 24 | addr as u32]
+}
+
+/// The swizzle offsets the console's block-wide prefix sums use in their
+/// bit-mask mode: quad-local (30) and not (120, with an or-mask).
+const SWIZZLES: [u16; 2] = [30, 120];
+
+/// `ds_swizzle_b32` of x in its bit-mask mode, every lane in EXEC: lane l
+/// reads lane (l & 32) | ((l & 31 & and) | or) ^ xor, within its own 32-lane
+/// half.
+fn swizzle_program(threads: u32) -> Vec<u32> {
+    let mut w = prologue();
+    for (n, offset) in SWIZZLES.into_iter().enumerate() {
+        w.extend(ds_swizzle_b32(4 + n as u8, 1, offset));
+    }
+    w.push(0xBF8C_C07F); // s_waitcnt lgkmcnt(0)
+    for n in 0..SWIZZLES.len() {
+        w.extend(store(4 + n as u8, n as u32, threads));
+    }
+    w.push(S_ENDPGM);
+    w
+}
+
+fn swizzle_model(threads: u32) -> Vec<u32> {
+    let mut want = vec![0; SWIZZLES.len() * threads as usize];
+    for wave in waves(threads) {
+        for t in wave.clone() {
+            let l = t % 64;
+            for (n, offset) in SWIZZLES.into_iter().enumerate() {
+                let (and, or, xor) = (u32::from(offset) & 31, u32::from(offset) >> 5 & 31, u32::from(offset) >> 10 & 31);
+                let from = (l & 32) | ((l & 31 & and) | or) ^ xor;
+                want[n * threads as usize + t as usize] = data(wave.start + from);
+            }
+        }
+    }
+    want
+}
+
+/// A select on a lane mask whose two dwords are written apart, as the
+/// console compiler writes "the upper half" (`s_mov_b32 s20, 0;
+/// s_mov_b32 s21, -1`): each lane takes its bit from its own half's dword.
+/// (A lane count, unused, makes the program read the console's lanes.)
+fn halves_mask_program(threads: u32) -> Vec<u32> {
+    let mut w = prologue();
+    // A lane count, unused: code reading lanes runs in the console's lanes.
+    w.extend([0xD765_000B, 0x0001_00C1]); // v_mbcnt_lo_u32_b32 v11, -1, 0
+    w.push(s_mov_b32(20, k(0)));
+    w.push(s_mov_b32(21, 193)); // -1
+    w.extend(vop3(0x100 | V_CNDMASK, 4, k(0), k(1), s(20)));
+    w.extend(store(4, 0, threads));
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn swizzles_read_within_their_own_half() {
+    let mut ran32 = 0;
+    for threads in GROUPS {
+        ran32 += run_everywhere(&swizzle_program(threads), threads, SWIZZLES.len() as u32, &swizzle_model(threads));
+    }
+    eprintln!("ran the 32-lane program on {ran32} hosts");
+}
+
+#[test]
+fn a_mask_written_by_dwords_gives_each_half_its_own() {
+    let mut ran32 = 0;
+    for threads in GROUPS {
+        let want: Vec<u32> = (0..threads).map(|t| u32::from(t % 64 >= 32)).collect();
+        ran32 += run_everywhere(&halves_mask_program(threads), threads, 1, &want);
+    }
+    eprintln!("ran the 32-lane program on {ran32} hosts");
+}

@@ -41,6 +41,7 @@ use super::super::bitcode::{Attr, Bin, V, pred};
 use super::super::shader::{Shader, flags};
 use super::super::wave::Op;
 use super::{Lower, Parts, Why};
+use crate::ir::{Reg, Value};
 use crate::structure::LaneExit;
 
 /// Group-shared memory a D3D12 compute shader may declare, in dwords.
@@ -159,6 +160,23 @@ fn uniform_blocks(exits: &[LaneExit]) -> Vec<bool> {
 }
 
 impl Lower<'_> {
+    /// The high dword `h` of a lane mask pair whose low dword `reg` holds
+    /// `lo`, written apart (`s_mov_b32 s20, 0; s_mov_b32 s21, -1`): what the
+    /// pair's readers read in `h` with this low dword, if they all read the
+    /// same (`Lower::pair_high`).
+    pub(super) fn high_read_with(&self, reg: Reg, lo: Value, h: Reg) -> Option<Value> {
+        let mut highs = self
+            .x
+            .p
+            .blocks
+            .iter()
+            .flat_map(|blk| &blk.insts)
+            .filter(|i| i.reads.iter().any(|r| r.0 == reg && r.1 == lo))
+            .filter_map(|i| i.read(h));
+        let first = highs.next()?;
+        highs.all(|v| v == first).then_some(first)
+    }
+
     /// The console lane, made in block `at`.
     pub(super) fn console_lane(&mut self, at: usize) -> V {
         let lane = self.host_lane(at);

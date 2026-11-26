@@ -2800,7 +2800,8 @@ impl<'a> Lower<'a> {
             .iter()
             .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
         let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
-        inst.write(pick(reg)?)
+        let h = pick(reg)?;
+        inst.write(h).or_else(|| self.high_read_with(reg, lo, h))
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
@@ -3224,7 +3225,9 @@ impl<'a> Lower<'a> {
             let q = self.s.m.bin(c, Bin::And, src, three);
             self.s.m.bin(c, Bin::Or, base, q)
         } else {
-            src
+            // Split: the ballot is the host wave's, this half's lanes; the
+            // source is a console lane of the same half.
+            self.half_local(src)
         };
         Some(self.lane_bit_of(c, ballot_lane, lo, hi))
     }
