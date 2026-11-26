@@ -105,7 +105,24 @@ pub(super) fn per_half_ok(&self) -> Result<(), Why> {
                     }
                     _ if name.starts_with("v_mbcnt") => out |= SLOT | RANK,
                     _ if name == "v_readlane_b32" || name == "v_readfirstlane_b32" => {
-                        let restored = inst.writes.first().is_some_and(|w| st.restored.contains_key(&w.1));
+                        let restored = inst.writes.first().is_some_and(|w| st.restored.contains_key(&w.1))
+                            // A waterfall loop's read of a descriptor dword:
+                            // the lane's own (`resource::Waterfall`); each half
+                            // runs its own loop.
+                            || inst.writes.first().is_some_and(|w| self.x.res.waterfall.reads.contains(&w.1))
+                            // A resource's index HLSL holds alike in the wave
+                            // (no `NonUniformResourceIndex`), read from the
+                            // first lane only to address a scalar load: each
+                            // half's first lane has the console wave's.
+                            || inst.writes.first().is_some_and(|w| {
+                                let uses: Vec<&Inst> = p
+                                    .blocks
+                                    .iter()
+                                    .flat_map(|blk| &blk.insts)
+                                    .filter(|u| u.reads.iter().any(|r| r.1 == w.1))
+                                    .collect();
+                                !uses.is_empty() && uses.iter().all(|u| matches!(u.fields, Fields::Smem { .. }))
+                            });
                         // A value every lane computed alike: the lane's own.
                         let alike = name == "v_readfirstlane_b32" && read == 0 && self.why_not_scalars(b, i, true).is_none();
                         #[cfg(test)]
@@ -120,6 +137,9 @@ pub(super) fn per_half_ok(&self) -> Result<(), Why> {
                         }
                     }
                     Fields::Valu(v) if v.dpp.is_some() || name.starts_with("v_permlane") => out |= AGG,
+                    // A waterfall loop's test of the lanes holding the first
+                    // lane's descriptor: each lane's own.
+                    Fields::Valu(_) if self.x.res.waterfall.compares.contains(&(b, i)) => out = 0,
                     Fields::Valu(_) if name.starts_with("v_cmp") => {
                         // The first-lane test: `s_ff1` of EXEC against the rank.
                         let firsts = inst.reads.iter().any(|r| of(&flags, r.1) & FIRST != 0);
@@ -139,6 +159,20 @@ pub(super) fn per_half_ok(&self) -> Result<(), Why> {
                     #[cfg(test)]
                     if std::env::var_os("VICTORY_ONE_CONTAINER").is_some() {
                         eprintln!("EXEC over lanes at {:#x} {name}", inst.machine.offset);
+                        // The chain back: each flagged value's maker, five deep.
+                        let mut todo: Vec<Value> = inst.reads.iter().filter(|r| of(&flags, r.1) != 0).map(|r| r.1).collect();
+                        let mut seen = HashSet::new();
+                        for _ in 0..12 {
+                            let Some(v) = todo.pop() else { break };
+                            if !seen.insert(v) { continue; }
+                            match self.def_site(v) {
+                                Some((_, _, w)) => {
+                                    eprintln!("  {v:?} flags {} by {} at {:#x}", of(&flags, v), w.name(), w.machine.offset);
+                                    todo.extend(w.reads.iter().filter(|r| of(&flags, r.1) != 0).map(|r| r.1));
+                                }
+                                None => eprintln!("  {v:?} flags {} a phi or input", of(&flags, v)),
+                            }
+                        }
                     }
                     return Err("EXEC set from a value over lanes");
                 }

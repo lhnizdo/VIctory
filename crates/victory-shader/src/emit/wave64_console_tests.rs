@@ -634,3 +634,257 @@ fn a_stored_lane_count_is_not_run_per_half() {
     assert_eq!(lower::PER_HALF_RUNS.with(std::cell::Cell::get), before, "a stored count was lowered per half");
     assert!(lowered.group_syncs > 0, "not run as the console runs it either");
 }
+
+/// [`atomic_slots_in_a_lane_branch`] with, before the branch, the first
+/// lane's `v0 & 0` (0, but per lane to the translation) read as a scalar
+/// load's offset, as the title reads a resource index HLSL holds alike in
+/// the wave, and what the load gave, `& 0`, added into the value stored;
+/// `stored`: the first lane's value itself added instead.
+fn atomic_slots_with_a_uniform_index(stored: bool) -> Vec<u32> {
+    let mut w = atomic_slots_in_a_lane_branch();
+    let at = w.iter().position(|&x| x == 0x7E1C_0280).expect("v_mov_b32 v14, 0") + 1;
+    w.splice(
+        at..at,
+        [
+            0x361E_0080, // v_and_b32 v15, 0, v0
+            0x7E20_050F, // v_readfirstlane_b32 s16, v15
+            0xF400_0442,
+            0x2000_0000, // s_load_dword s17, s[4:5], s16
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ],
+    );
+    let at = w.iter().position(|&x| x == 0x4A22_0081).expect("v_add_nc_u32 v17, 1, v0") + 1;
+    if stored {
+        w.insert(at, 0x4A22_2210); // v_add_nc_u32 v17, s16, v17
+    } else {
+        // What the load gave (as the title reads through a descriptor so
+        // loaded), with nothing changed: s17 & 0 added.
+        w.splice(
+            at..at,
+            [
+                0x8712_8011, // s_and_b32 s18, s17, 0
+                0x4A22_2212, // v_add_nc_u32 v17, s18, v17
+            ],
+        );
+    }
+    w
+}
+
+#[test]
+fn a_first_lane_resource_index_keeps_a_program_per_half() {
+    let words = atomic_slots_with_a_uniform_index(false);
+    let names: Vec<&str> = {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        crate::gfx10::decode(&code).expect("decode").iter().map(|i| i.name().unwrap_or("?")).collect()
+    };
+    assert!(names.contains(&"v_readfirstlane_b32") && names.contains(&"s_load_dword"), "{names:?}");
+    let before = lower::PER_HALF_RUNS.with(std::cell::Cell::get);
+    let lowered = lowered_with(&words, 1 << 1);
+    assert!(lower::PER_HALF_RUNS.with(std::cell::Cell::get) > before, "not lowered per half");
+    assert_eq!(lowered.group_syncs, 0);
+    let shader = shader(lowered);
+    let views = [View::RawUav(THREADS)];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Ok(host) = Host::new(false) {
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(&root, &pso, &Dispatch { roots: vec![(0, Root::Constants(ud))], views: &views, samplers: &[], groups: [1, 1, 1] })
+            .expect("dispatch");
+        let out = &out[0][..THREADS as usize];
+        assert_eq!(out[0], 40, "the counter");
+        let mut slots = out[1..41].to_vec();
+        slots.sort_unstable();
+        assert_eq!(slots, (1..=40).collect::<Vec<u32>>(), "one slot per lane");
+    } else {
+        eprintln!("no SM 6.6 hardware device; the run skipped");
+    }
+}
+
+#[test]
+fn a_first_lane_value_stored_keeps_a_program_out_of_per_half() {
+    let words = atomic_slots_with_a_uniform_index(true);
+    let before = lower::PER_HALF_RUNS.with(std::cell::Cell::get);
+    let lowered = lowered_with(&words, 1 << 1);
+    assert_eq!(lower::PER_HALF_RUNS.with(std::cell::Cell::get), before, "lowered per half");
+    assert!(lowered.group_syncs > 0, "not run as the console runs it either");
+}
+
+// ---- wave64 waterfalls over table entries (the console compiler's form) ----
+
+/// The console compiler's waterfall in a wave64 program of one console
+/// wave: each lane holds its table entry's byte offset (`(t & 1) * 32`:
+/// even lanes the first buffer, odd ones the second); the loop reads the
+/// first active lane's offset, narrows EXEC to the lanes with the same one
+/// (`v_cmpx_eq_u32`), loads that entry (`s_load_dwordx4` at the offset) and
+/// dword `t` of the buffer, then drops those lanes. What each lane loaded
+/// goes to the UAV (table entry 2) at dword 64 + t. With `atomic`, it all
+/// runs in a lane branch (t < 40) after the atomic optimizer of
+/// [`atomic_slots_in_a_lane_branch`], which only per half takes.
+fn indexed_waterfall(atomic: bool) -> Vec<u32> {
+    let mut w = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40 (entry 2)
+        0x3424_0082, // v_lshlrev_b32 v18, 2, v0
+        0x360E_0081, // v_and_b32 v7, 1, v0
+        0x340E_0E85, // v_lshlrev_b32 v7, 5, v7
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ];
+    let mut body = vec![
+        0xBE96_047E, // s_mov_b64 s[22:23], exec
+        0xBE98_047E, // s_mov_b64 s[24:25], exec
+        0x7E28_0507, // loop: v_readfirstlane_b32 s20, v7
+        0x7DA4_0E14, // v_cmpx_eq_u32 exec, s20, v7
+        0xF408_0302,
+        0x2800_0000, // s_load_dwordx4 s[12:15], s[4:5], s20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE030_2000,
+        0x8003_0C00, // buffer_load_dword v12, v0, s[12:15], 0 idxen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x8A98_7E18, // s_andn2_b64 s[24:25], s[24:25], exec
+        0xBEFE_0418, // s_mov_b64 exec, s[24:25]
+        0xBF89_FFF5, // s_cbranch_execnz loop
+        0xBEFE_0416, // s_mov_b64 exec, s[22:23]
+        0xE070_1100,
+        0x800A_0C12, // buffer_store_dword v12, v18, s[40:43], 0 offen offset:256
+    ];
+    if atomic {
+        // The atomic optimizer's body (its prologue and end left out), then
+        // the waterfall, all in the branch.
+        let slots = atomic_slots_in_a_lane_branch();
+        let from = slots.iter().position(|&x| x == 0x7E1C_0280).expect("v_mov_b32 v14, 0");
+        let join = slots.iter().position(|&x| x == 0x88FE_067E).expect("s_or_b64 exec, exec, s[6:7]");
+        let mut branch: Vec<u32> = slots[from..join].to_vec();
+        branch.append(&mut body);
+        // The branch's skip, over the waterfall too.
+        let skip = branch.iter().position(|&x| x & 0xFFFF_0000 == 0xBF88_0000).expect("s_cbranch_execz");
+        let len = (branch.len() - skip - 1) as u32;
+        branch[skip] = 0xBF88_0000 | len;
+        body = branch;
+        body.push(0x88FE_067E); // s_or_b64 exec, exec, s[6:7]
+    }
+    w.append(&mut body);
+    w.push(0xBF81_0000); // s_endpgm
+    w
+}
+
+/// [`lowered_with`] for a table of two structured buffers of dwords
+/// (entries 0 and 1, eight dwords apart) and a raw UAV (entry 2), no LDS.
+fn lowered_with_buffers(words: &[u32]) -> lower::Lowered {
+    let range = |kind, table_offset_dwords, stride| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords,
+        lower_bound: 0,
+        stride,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 32,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![range(ResourceType::Srv, 0, 4), range(ResourceType::Uav, 16, 0)],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 1,
+            threads: [THREADS, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    assert!(!res.waterfall.loads.is_empty(), "the loop is not taken for a waterfall");
+    let io = io::raise(&p, &native).expect("io::raise");
+    lower::lower_for(
+        &lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            view_marks: false,
+        },
+        false,
+    )
+    .expect("lower")
+}
+
+/// Runs `shader` with the two buffers (dword t: 100 + t, 200 + t) and the
+/// UAV of 128 dwords on the hardware adapter; the UAV, or none.
+fn run_with_buffers(shader: &HostShader) -> Option<Vec<u32>> {
+    use super::host::Stride;
+    let first: Vec<u32> = (0..THREADS).map(|t| 100 + t).collect();
+    let second: Vec<u32> = (0..THREADS).map(|t| 200 + t).collect();
+    let views = [
+        View::Buffer { data: &first, stride: Stride::Structured(4) },
+        View::Buffer { data: &second, stride: Stride::Structured(4) },
+        View::RawUav(2 * THREADS),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; the run skipped");
+        return None;
+    };
+    let (root, pso) = host.compute_pipeline(shader).expect("pipeline");
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(&root, &pso, &Dispatch { roots: vec![(0, Root::Constants(ud))], views: &views, samplers: &[], groups: [1, 1, 1] })
+        .expect("dispatch");
+    Some(out.into_iter().last().expect("the UAV"))
+}
+
+/// The waterfall alone, in the split (two host waves): every lane loads from
+/// the buffer its entry names.
+#[test]
+fn a_wave64_waterfall_over_table_entries_gives_each_lane_its_own() {
+    let words = indexed_waterfall(false);
+    let lowered = lowered_with_buffers(&words);
+    let Some(out) = run_with_buffers(&shader(lowered)) else { return };
+    let want: Vec<u32> = (0..THREADS).map(|t| if t & 1 == 0 { 100 + t } else { 200 + t }).collect();
+    assert_eq!(out[64..128], want[..], "each lane's own buffer");
+}
+
+/// The waterfall after the atomic optimizer in a lane branch: per half, as
+/// the waterfall's first-lane reads and tests are each lane's own; the
+/// lanes in the branch (t < 40) load from their own buffer and take one
+/// slot each.
+#[test]
+fn a_wave64_waterfall_runs_per_half_beside_the_atomic_optimizer() {
+    let words = indexed_waterfall(true);
+    let before = lower::PER_HALF_RUNS.with(std::cell::Cell::get);
+    let lowered = lowered_with_buffers(&words);
+    assert!(lower::PER_HALF_RUNS.with(std::cell::Cell::get) > before, "not lowered per half");
+    let Some(out) = run_with_buffers(&shader(lowered)) else { return };
+    assert_eq!(out[0], 40, "the counter");
+    let mut slots = out[1..41].to_vec();
+    slots.sort_unstable();
+    assert_eq!(slots, (1..=40).collect::<Vec<u32>>(), "one slot per lane");
+    let want: Vec<u32> = (0..THREADS)
+        .map(|t| match (t < 40, t & 1) {
+            (false, _) => 0,
+            (true, 0) => 100 + t,
+            (true, _) => 200 + t,
+        })
+        .collect();
+    assert_eq!(out[64..128], want[..], "each lane's own buffer");
+}
