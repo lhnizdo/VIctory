@@ -162,9 +162,13 @@ impl Changed {
         if !saved.armed(page) || saved.bytes.contains_key(&page) {
             return;
         }
-        let mut bytes = vec![0u8; PAGE].into_boxed_slice();
-        if crate::host::read_into((page * PAGE) as *const u8, &mut bytes) {
-            saved.bytes.insert(page, bytes);
+        // Read under the lock, so the bytes belong to this arming of the
+        // page; into a buffer that is not zeroed first: the read writes all
+        // of it, and a read that fails keeps none of it.
+        let mut bytes = Box::<[u8]>::new_uninit_slice(PAGE);
+        if crate::host::read_into_uninit((page * PAGE) as *const u8, &mut bytes) {
+            // SAFETY: the read succeeded, so it wrote every byte.
+            saved.bytes.insert(page, unsafe { bytes.assume_init() });
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SavedPages, 1);
         }
@@ -1208,6 +1212,19 @@ pub(crate) mod tests {
         assert!(t.clean());
         drop(t);
         free(p);
+    }
+
+    /// The kernel read `Changed::save` fills an unzeroed buffer with fails
+    /// rather than faulting on memory it cannot read, so no unwritten
+    /// bytes are kept; a read that succeeds writes them all.
+    #[test]
+    fn a_read_into_an_unwritten_buffer_fails_on_an_unreadable_source() {
+        let mut dst = Box::<[u8]>::new_uninit_slice(64);
+        assert!(!crate::host::read_into_uninit(std::ptr::null(), &mut dst));
+        let src = [7u8; 64];
+        assert!(crate::host::read_into_uninit(src.as_ptr(), &mut dst));
+        // SAFETY: the read succeeded, so it wrote every byte.
+        assert_eq!(&*unsafe { dst.assume_init() }, &src[..]);
     }
 
     /// Pages of the ranges armed keep their bytes from before the first
