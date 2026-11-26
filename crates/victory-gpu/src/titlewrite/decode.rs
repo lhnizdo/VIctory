@@ -442,6 +442,7 @@ impl Store {
     /// (`victory_loader::write_sites`, which looks itself): an `or` of a byte
     /// with a constant, a move of 4 bytes or more; of the five bytes a jump
     /// needs.
+    #[allow(dead_code)] // (avatarmanz's learned sites; not used here)
     pub(super) fn can_look(&self, code: &[u8]) -> bool {
         let at = usize::from(code[0] & 0xf0 == 0x40);
         self.len >= 5

@@ -3163,10 +3163,10 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             if crate::titlewrite::stats_on() {
-                let [looked, understood, same, stepped] =
+                let [looked, understood, same, stepped, beside] =
                     crate::titlewrite::take().map(|n| n as f64 / report_frames);
                 tracing::info!(
-                    "faulting stores per frame: {looked:.0}, {understood:.0} understood, {same:.0} of them leaving the memory as it is, {stepped:.0} stepped over"
+                    "faulting stores per frame: {looked:.0}, {understood:.0} understood, {same:.0} of them leaving the memory as it is, {stepped:.0} stepped over, {beside:.0} made beside the guards"
                 );
             }
             let m = crate::shadow::MARKED_PARTS.each_ref().map(|a| a.swap(0, Ordering::Relaxed) as f64);

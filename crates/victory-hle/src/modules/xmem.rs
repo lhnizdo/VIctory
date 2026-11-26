@@ -363,7 +363,10 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+/// A section, and a view of all of it of our own (0: none), through which
+/// stores into its pages go beside the GPU side's guards
+/// (`victory_gpu::title_memory_beside`).
+struct Section(HANDLE, usize);
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -372,8 +375,16 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
-        // SAFETY: our handle; views keep the section alive on their own.
-        unsafe { CloseHandle(self.0) };
+        // SAFETY: our view and handle; views keep the section alive on
+        // their own.
+        unsafe {
+            if self.1 != 0 {
+                windows_sys::Win32::System::Memory::UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: self.1 as *mut c_void,
+                });
+            }
+            CloseHandle(self.0)
+        };
     }
 }
 
@@ -515,7 +526,19 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
+    // Our view of all of it: the GPU side's stores beside its guards.
+    // SAFETY: a view of the section just made; unmapped when it goes.
+    let ours = unsafe {
+        windows_sys::Win32::System::Memory::MapViewOfFile(
+            handle,
+            windows_sys::Win32::System::Memory::FILE_MAP_WRITE,
+            0,
+            0,
+            size,
+        )
+    }
+    .Value as usize;
+    let section = Arc::new(Section(handle, ours));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -843,6 +866,9 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         // Pages shown elsewhere already: guarded here too if they are there.
         victory_gpu::title_memory_aliased(base + k * PAGE, shown);
         shown.push(base + k * PAGE);
+        if slice.section.1 != 0 {
+            victory_gpu::title_memory_beside(base + k * PAGE, slice.section.1 + (slice.index + k) * PAGE);
+        }
     }
     physical.views.insert(base, (len, slice));
     true
@@ -975,6 +1001,8 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 }
             }
         }
+        // No store beside the guards to these pages from now on.
+        victory_gpu::title_memory_beside_gone(at, size);
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {

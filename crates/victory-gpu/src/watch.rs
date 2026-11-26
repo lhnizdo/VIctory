@@ -887,6 +887,63 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
     }
 }
 
+/// Our own view of the title pages that show a section (`victory_hle`'s
+/// physical pages): the address of a page there, by title page number. A
+/// store beside a guard is made while this is read; the runtime changes it
+/// before it unmaps a view ([`title_memory_beside_gone`]), so no store goes
+/// to a page the title address no longer shows.
+static BESIDE_VIEWS: std::sync::RwLock<BTreeMap<usize, usize>> = std::sync::RwLock::new(BTreeMap::new());
+
+/// The runtime mapped a section's page at title address `at` (a 64 KiB
+/// page); `ours` shows the same page, writable, at an address of our own.
+pub fn title_memory_beside(at: usize, ours: usize) {
+    BESIDE_VIEWS.write().unwrap_or_else(|e| e.into_inner()).insert(at / PAGE, ours);
+}
+
+/// The runtime is about to unmap (or map over) `[at, at + len)`: no store
+/// goes beside its guards from now on, and none is under way.
+pub fn title_memory_beside_gone(at: usize, len: usize) {
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    let mut views = BESIDE_VIEWS.write().unwrap_or_else(|e| e.into_inner());
+    let gone: Vec<usize> = views.range(first..last).map(|(&p, _)| p).collect();
+    for page in gone {
+        views.remove(&page);
+    }
+}
+
+/// A store that faulted at `at`, into a guarded block of ours showing a
+/// section: made through our view of its page, the block marked changed in
+/// every tracker (and its other views'), and left read-only (no change of
+/// protection). The write is made holding the guards, so no copy takes the
+/// block between its mark and its bytes. False if it is not for here.
+fn store_beside(context: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT, at: usize) -> bool {
+    let Some(store) = crate::titlewrite::decoded(context, at) else {
+        return false;
+    };
+    let page = at / PAGE;
+    let views = BESIDE_VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    let Some(&ours) = views.get(&page) else {
+        return false;
+    };
+    let mut g = guards();
+    if !g.protected.contains(&page) || !crate::titlewrite::may_skip(page, crate::titlewrite::A_STORE) {
+        return false;
+    }
+    let others: Vec<usize> = g.alias_of.get(&page).cloned().unwrap_or_default();
+    mark_changed(&mut g, page, page + 1, true);
+    for &other in &others {
+        mark_changed(&mut g, other, other + 1, true);
+    }
+    // SAFETY: `ours` shows the block's page, writable; the store stays in it.
+    if !unsafe { store.run_at(context, ours.wrapping_sub(page * PAGE)) } {
+        // (Marked changed for nothing: the fault opens the block as before.)
+        return false;
+    }
+    context.Rip += store.len() as u64;
+    crate::titlewrite::BESIDE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 fn install() {
@@ -921,12 +978,20 @@ fn install() {
             let context = unsafe { &mut *(*info).ContextRecord };
             if let Some((len, flags)) = crate::titlewrite::unchanged(context, at) {
                 let ours = guards().protected.contains(&(at / PAGE));
-                if ours && crate::titlewrite::may_skip(at / PAGE) {
+                if ours && crate::titlewrite::may_skip(at / PAGE, 1) {
                     context.Rip += len as u64;
                     context.EFlags = flags;
                     crate::titlewrite::STEPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
+            }
+        }
+        // Into memory showing a section: made beside the guard.
+        if crate::titlewrite::beside_on() {
+            // SAFETY: as above.
+            let context = unsafe { &mut *(*info).ContextRecord };
+            if store_beside(context, at) {
+                return EXCEPTION_CONTINUE_EXECUTION;
             }
         }
         // Held across both checks: another thread may have opened the block
@@ -1329,6 +1394,53 @@ pub(crate) mod tests {
             title_memory_aliased(b + k, &[a + k]);
         }
         (a, b)
+    }
+
+    /// With stores made beside the guards (`crate::titlewrite::beside_on`):
+    /// a store into a taken title view of a section, whose page our own view
+    /// shows (`title_memory_beside`), lands through ours. The title's view
+    /// stays read-only, shows the store, and so does its other mapping; the
+    /// tracker has the page changed. With the switch off, the same store
+    /// opens the view, as before.
+    #[test]
+    fn a_store_beside_the_guard_keeps_it_and_marks_the_tracker() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_BASIC_INFORMATION, MapViewOfFile, PAGE_READONLY, VirtualQuery,
+        };
+        let protection = |at: usize| {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+            info.Protect
+        };
+        // SAFETY: a pagefile section of one page mapped three times, kept.
+        let (a, b, ours) = unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, PAGE as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let view = || MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE).Value as usize;
+            (view(), view(), view())
+        };
+        assert!(a != 0 && b != 0 && ours != 0);
+        title_memory_aliased(b, &[a]);
+        title_memory_beside(a, ours);
+        let t = track(a, PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert_eq!(protection(a), PAGE_READONLY, "taken");
+        crate::titlewrite::BESIDE_IN_TEST.set(true);
+        // SAFETY: (writes and reads below) a dword of the title's view.
+        unsafe { ((a + 100) as *mut u32).write_volatile(9) };
+        crate::titlewrite::BESIDE_IN_TEST.set(false);
+        assert_eq!(protection(a), PAGE_READONLY, "the store opened the view");
+        // SAFETY: as above, and the same page at the other mapping.
+        let (here, there) = unsafe { (((a + 100) as *const u32).read_volatile(), ((b + 100) as *const u32).read_volatile()) };
+        assert_eq!((here, there), (9, 9), "the store at both title mappings");
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)], "the tracker has the page changed");
+        // Switch off: the store opens the view.
+        // SAFETY: as above.
+        unsafe { ((a + 200) as *mut u32).write_volatile(3) };
+        assert_ne!(protection(a), PAGE_READONLY, "opened as before");
+        title_memory_beside_gone(a, PAGE);
     }
 
     /// A write through another mapping of the same pages marks the tracker
