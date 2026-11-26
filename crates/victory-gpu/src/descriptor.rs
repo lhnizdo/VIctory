@@ -506,8 +506,17 @@ fn record(handle: u64, view: View) {
         }
     };
     let generation = views.list[i as usize].1;
+    let bytes = [VIEW_TAG, i, generation];
+    // The title makes the same view in the same slot frame after frame, and
+    // its descriptor memory is guarded: a write of what is there already
+    // would fault, open the block and have it copied again (40-120 faults
+    // a frame in the world on an RTX 2080). A read takes no fault.
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
-    unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
+    let there = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    if there != bytes {
+        // SAFETY: as above.
+        unsafe { (handle as *mut [u32; 3]).write_unaligned(bytes) };
+    }
     drop(views);
     #[cfg(windows)]
     mirror(handle);
