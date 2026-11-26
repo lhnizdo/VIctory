@@ -8,6 +8,49 @@
 use super::*;
 
 impl<'a> Lower<'a> {
+    /// Console mode's parked lanes ([`Lower::parked`]): a phi of whether a
+    /// lane is parked at every loop header, false on entry. A latch whose
+    /// exit is decided for the wave parks the lanes that would have left
+    /// ([`Lower::wave_branch`]), and every instruction in the loop is then
+    /// guarded by `!parked` too ([`Lower::unparked`]).
+    // shortcut: a lane is parked only at a latch whose other side leaves
+    // the loop (the do-while shape); a branch going round the loop from
+    // the middle keeps its lanes running to the latch.
+    pub(super) fn park_lanes(&mut self, order: &[usize]) {
+        let loops = self.barrier_loops(order);
+        let headers: Vec<usize> = self.counters.keys().copied().collect();
+        for h in headers {
+            let Some(&(_, last, _)) = loops.iter().find(|l| l.0 == h) else {
+                continue;
+            };
+            let blk = self.block[h].expect("reachable");
+            let phi = self.s.m.phi(blk, self.s.t.i1);
+            self.parked.insert(h, (phi, Vec::new(), last));
+        }
+    }
+
+    /// `guard` with the lanes parked in every loop holding block `b` left
+    /// out.
+    pub(super) fn unparked(&mut self, b: usize, guard: Option<V>) -> Option<V> {
+        let parked: Vec<V> = self
+            .parked
+            .iter()
+            .filter(|&(&h, &(_, _, last))| self.rpo[h] <= self.rpo[b] && self.rpo[b] <= self.rpo[last])
+            .map(|(_, &(phi, _, _))| phi)
+            .collect();
+        let mut guard = guard;
+        for phi in parked {
+            let c = self.cur;
+            let yes = self.s.m.bool(true);
+            let running = self.s.m.bin(c, Bin::Xor, phi, yes);
+            guard = Some(match guard {
+                Some(g) => self.s.m.bin(c, Bin::And, g, running),
+                None => running,
+            });
+        }
+        guard
+    }
+
     /// A group barrier (`s_barrier`): thread-group sync with a shared-memory
     /// fence, and a UAV fence when the program writes UAVs (the waits before
     /// an s_barrier make those writes visible on the console).
