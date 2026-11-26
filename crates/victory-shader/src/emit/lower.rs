@@ -2900,7 +2900,21 @@ impl<'a> Lower<'a> {
             .iter()
             .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
         let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
-        inst.write(pick(reg)?)
+        let h = pick(reg)?;
+        if let Some(v) = inst.write(h) {
+            return Some(v);
+        }
+        // The dwords written apart (`s_mov_b32 s0, ...; s_mov_b32 s1, ...`):
+        // the high dword the pair's readers read with this low one, if they
+        // all read the same.
+        let mut highs = p
+            .blocks
+            .iter()
+            .flat_map(|blk| &blk.insts)
+            .filter(|i| i.reads.iter().any(|r| r.0 == reg && r.1 == lo))
+            .filter_map(|i| i.read(h));
+        let first = highs.next()?;
+        highs.all(|v| v == first).then_some(first)
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
@@ -3357,7 +3371,9 @@ impl<'a> Lower<'a> {
             let q = self.s.m.bin(c, Bin::And, src, three);
             self.s.m.bin(c, Bin::Or, base, q)
         } else {
-            src
+            // Split: the ballot is the host wave's, this half's lanes; the
+            // source is a console lane of the same half.
+            self.half_local(src)
         };
         Some(self.lane_bit_of(c, ballot_lane, lo, hi))
     }

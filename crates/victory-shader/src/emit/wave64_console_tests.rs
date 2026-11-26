@@ -1015,3 +1015,174 @@ fn a_first_lane_read_of_lds_written_after_the_barrier_is_refused() {
         .expect("an LDS read written after its barrier taken as alike");
     assert!(e.contains("not every thread"), "{e}");
 }
+
+/// Local check, no game data in the repo: `VICTORY_SCAN_CONTAINER` is the
+/// path of a block-wide prefix sum compute container (the console's BVH
+/// builder has three: `VICTORY_SCAN_THREADS` threads, each loading
+/// `VICTORY_SCAN_ELEMS` dwords from its first root UAV and storing their
+/// exclusive prefix over the group there, and the group's total at its
+/// index in the second root UAV when bit 0 of the root constant is set).
+/// Translated for a 32-lane host and run on the hardware adapter over random
+/// values through title memory, against a CPU reference.
+#[test]
+fn one_container_block_scan_matches_its_reference() {
+    let (Some(path), Ok(threads), Ok(elems)) = (
+        std::env::var_os("VICTORY_SCAN_CONTAINER"),
+        std::env::var("VICTORY_SCAN_THREADS").map(|v| v.parse::<usize>().expect("threads")),
+        std::env::var("VICTORY_SCAN_ELEMS").map(|v| v.parse::<usize>().expect("elements")),
+    ) else {
+        return;
+    };
+    const TITLE: u64 = 0x12_3450_0000;
+    const TOTALS: u64 = 0xC000;
+    let groups = 3usize;
+    let bytes = std::fs::read(path).expect("container");
+    super::set_host_wave64(false);
+    let shader = super::translate_with(&bytes, super::Options::default()).expect("translates");
+    assert!(shader.memory && shader.memory_writes, "root UAVs as title memory");
+    assert!(shader.root_cbvs.is_empty() && shader.root_srvs.is_empty() && shader.root_uavs.is_empty());
+    // The page table for one 64 KiB copy of title memory at TITLE, its views
+    // at heap index 0, the null pair at 2 (`bvh_tests::page_table`).
+    let (hi, lo) = ((TITLE >> 32) as u32, TITLE as u32);
+    let mut table = vec![0u32; 4096];
+    table[(hi << 4 | lo >> 28) as usize] = 1;
+    for _ in 0..2 * 4096 {
+        table.extend([2, 0]);
+    }
+    let entry = 4096 + 2 * (4096 + (lo >> 16 & 0xFFF) as usize);
+    table[entry..entry + 2].copy_from_slice(&[0, lo]);
+    let n = groups * threads * elems;
+    assert!(n * 4 <= TOTALS as usize, "the values fit below the totals");
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let mut memory = vec![0u32; 0x1_0000 / 4];
+    for v in &mut memory[..n] {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        *v = (seed % 1000) as u32;
+    }
+    let mut want = memory.clone();
+    for g in 0..groups {
+        let mut sum = 0u32;
+        for i in g * threads * elems..(g + 1) * threads * elems {
+            let v = memory[i];
+            want[i] = sum;
+            sum = sum.wrapping_add(v);
+        }
+        want[TOTALS as usize / 4 + g] = sum;
+    }
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        ud[u.index as usize] = match (u.root, u.slot) {
+            (RootType::Descriptor, 0) => (TITLE >> (32 * u.dword)) as u32,
+            (RootType::Descriptor, 1) => ((TITLE + TOTALS) >> (32 * u.dword)) as u32,
+            (RootType::Constants, _) => u32::from(u.dword == 0),
+            _ => panic!("{u:?}"),
+        };
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![
+                    (0, Root::Constants(ud)),
+                    (1, Root::View { srv: true, data: table }),
+                    (2, Root::Uav(2 * 4096 / 32)),
+                ],
+                views: &[View::Memory(&memory), View::Pair, View::NullPair, View::Pair],
+                samplers: &[],
+                groups: [groups as u32, 1, 1],
+            },
+        )
+        .expect("dispatch");
+    let got = &out[0];
+    let bad: Vec<usize> = (0..n).filter(|&i| got[i] != want[i]).collect();
+    if let Some(&i) = bad.first() {
+        panic!(
+            "{} of {n} prefixes wrong; first at {i} (group {}, thread {}, element {}): {} for {}",
+            bad.len(),
+            i / (threads * elems),
+            i / elems % threads,
+            i % elems,
+            got[i],
+            want[i]
+        );
+    }
+    let t = TOTALS as usize / 4;
+    assert_eq!(got[t..t + groups], want[t..t + groups], "the group totals");
+    eprintln!("{n} prefixes and {groups} totals match");
+}
+
+/// Runs `words` (a split program: more than one console wave, no LDS) for a
+/// group of `threads` on the hardware adapter; its UAV of `threads` dwords.
+fn run_split(words: &[u32], threads: u32) -> Option<Vec<u32>> {
+    let lowered = lowered_sized(words, 1 << 1, threads).unwrap_or_else(|e| panic!("refused: {e}"));
+    let shader = shader(lowered);
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return None;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let views = [View::RawUav(threads)];
+    let out = host
+        .dispatch(&root, &pso, &Dispatch { roots: vec![(0, Root::Constants(ud))], views: &views, samplers: &[], groups: [1, 1, 1] })
+        .expect("dispatch");
+    Some(out[0][..threads as usize].to_vec())
+}
+
+/// `ds_swizzle_b32` in its bit-mask mode works within each 32 lanes of the
+/// console wave: lane l reads lane (l & ~31) | ((l & 31 & and) | or) ^ xor.
+/// In the split each half is a host wave of its own, and its lanes read
+/// their own half. A lane count (unused) makes the program split.
+#[test]
+fn a_wave64_swizzle_reads_within_each_half() {
+    for offset in [30u32, 120] {
+        let mut w = PROLOGUE.to_vec();
+        w.extend([
+            0xD765_000A,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v10, -1, 0 (console lanes: the split)
+            0x7E0A_0300, // v_mov_b32 v5, v0
+            0xD8D4_0000 | offset,
+            0x0100_0005, // ds_swizzle_b32 v1, v5 offset:<offset>
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ]);
+        w.extend_from_slice(EPILOGUE);
+        let Some(out) = run_split(&w, 128) else { return };
+        let (and, or, xor) = (offset & 31, offset >> 5 & 31, offset >> 10 & 31);
+        let want: Vec<u32> = (0..128).map(|l| (l & !31) | ((l & 31 & and) | or) ^ xor).collect();
+        assert_eq!(out, want, "offset {offset}");
+    }
+}
+
+/// A select on a lane mask whose two dwords are written apart
+/// (`s_mov_b32 s0, 0; s_mov_b32 s1, -1`, as the console compiler does):
+/// lanes 32-63 of each console wave take their bit from the high dword.
+#[test]
+fn a_wave64_select_on_a_mask_written_by_halves_takes_each_halfs_dword() {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0xD765_000A,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v10, -1, 0 (console lanes: the split)
+        0xBE80_0380, // s_mov_b32 s0, 0
+        0xBE81_03C1, // s_mov_b32 s1, -1
+        0xD501_0001,
+        0x0001_0280, // v_cndmask_b32 v1, 0, 1, s[0:1]
+    ]);
+    w.extend_from_slice(EPILOGUE);
+    let Some(out) = run_split(&w, 128) else { return };
+    let want: Vec<u32> = (0..128).map(|l| u32::from(l & 32 != 0)).collect();
+    assert_eq!(out, want);
+}
