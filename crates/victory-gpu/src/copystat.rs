@@ -213,7 +213,79 @@ pub(crate) fn page_faults() -> u64 {
 
 /// Logs the counters per frame over `frames` frames, and the ranges that
 /// took most bytes.
+/// Guard faults by the address of the instruction that wrote, since the last
+/// report (`VICTORY_FAULT_SITES=1`): where the title's writes into guarded
+/// blocks come from (its `memcpy` and `memset`, single stores).
+static FAULT_SITES: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+
+/// Whether fault sites are counted (`VICTORY_FAULT_SITES=1`).
+pub(crate) fn fault_sites_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_FAULT_SITES").is_ok_and(|v| v == "1"))
+}
+
+/// Counts a guard fault at instruction address `rip`.
+pub(crate) fn fault_site(rip: usize) {
+    let mut m = FAULT_SITES.lock().unwrap_or_else(|e| e.into_inner());
+    *m.get_or_insert_with(HashMap::new).entry(rip).or_insert(0) += 1;
+}
+
+/// The module holding `at` and `at`'s offset in it, as `name+0xoffset`.
+#[cfg(windows)]
+fn module_offset(at: usize) -> String {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        GetModuleFileNameW, GetModuleHandleExW,
+    };
+    let mut module = std::ptr::null_mut();
+    // SAFETY: an address and an out pointer; the reference count is left.
+    let ok = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            at as *const u16,
+            &mut module,
+        )
+    };
+    if ok == 0 {
+        return format!("{at:#x}");
+    }
+    let mut name = [0u16; 260];
+    // SAFETY: a module handle and a buffer of that length.
+    let n = unsafe { GetModuleFileNameW(module, name.as_mut_ptr(), name.len() as u32) } as usize;
+    let path = String::from_utf16_lossy(&name[..n]);
+    let file = path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned();
+    format!("{file}+{:#x}", at - module as usize)
+}
+
+/// Logs the busiest fault sites since the last report, per frame.
+fn log_fault_sites(frames: f64) {
+    let Some(m) = FAULT_SITES.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    let total: u64 = m.values().sum();
+    let mut sites: Vec<(usize, u64)> = m.into_iter().collect();
+    sites.sort_unstable_by_key(|&(_, n)| std::cmp::Reverse(n));
+    let top: Vec<String> = sites
+        .iter()
+        .take(12)
+        .map(|&(rip, n)| {
+            #[cfg(windows)]
+            let at = module_offset(rip);
+            #[cfg(not(windows))]
+            let at = format!("{rip:#x}");
+            format!("{at} {:.1}", n as f64 / frames)
+        })
+        .collect();
+    tracing::info!(
+        "guard faults per frame by site: {:.1} at {} sites; {}",
+        total as f64 / frames,
+        sites.len(),
+        top.join(", ")
+    );
+}
+
 pub(crate) fn log(frames: f64) {
+    log_fault_sites(frames);
     static FAULTS: AtomicU64 = AtomicU64::new(0);
     let faults = page_faults();
     let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);

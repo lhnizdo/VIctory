@@ -912,6 +912,11 @@ fn install() {
         if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+            #[cfg(feature = "diagnostics")]
+            if crate::copystat::fault_sites_on() {
+                // SAFETY: the system passes the faulting thread's context.
+                crate::copystat::fault_site(unsafe { (*(*info).ContextRecord).Rip } as usize);
+            }
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
