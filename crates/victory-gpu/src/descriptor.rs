@@ -857,6 +857,39 @@ pub(crate) mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
 
+    /// A view recorded again in the slot that holds its record already is
+    /// not written: the title's descriptor memory is guarded, and a write of
+    /// what is there would fault. On a read-only page the second record
+    /// would be an access violation.
+    #[cfg(windows)]
+    #[test]
+    fn a_record_already_in_its_slot_is_not_written_again() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        // SAFETY: a fresh page of our own.
+        let page = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!page.is_null());
+        let handle = page as u64 + 32;
+        let view = View::Constant(0x1234_0000, 256);
+        record(handle, view.clone());
+        // SAFETY: the slot is on the page.
+        let first = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        assert_eq!(first[0], VIEW_TAG);
+        let mut old = 0;
+        // SAFETY: our page.
+        assert_ne!(unsafe { VirtualProtect(page, 4096, PAGE_READONLY, &mut old) }, 0);
+        record(handle, view);
+        // SAFETY: as above.
+        assert_eq!(unsafe { (handle as *const [u32; 3]).read_unaligned() }, first);
+        // SAFETY: our page, no longer used.
+        unsafe {
+            VirtualProtect(page, 4096, PAGE_READWRITE, &mut old);
+            VirtualFree(page, 0, MEM_RELEASE);
+        }
+    }
+
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.
     #[repr(C)]
