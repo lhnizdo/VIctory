@@ -83,6 +83,12 @@ static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
 static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// Of the copying back, microseconds by part: the missed checks and the
+/// ranges gathered, the marked pages ended, the read views made, the
+/// ranges compared and copied, the lists' work after.
+static COPY_BACK_PARTS: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
 /// refreshes (microseconds, bytes hashed), since the last frame-rate line.
 pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
@@ -1384,6 +1390,12 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
+        let mut lap_at = copying;
+        let mut lap = |part: usize| {
+            let now = std::time::Instant::now();
+            COPY_BACK_PARTS[part].fetch_add((now - lap_at).as_micros() as u64, Ordering::Relaxed);
+            lap_at = now;
+        };
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
         // One list's lock at a time: a submission may name a list twice.
@@ -1441,12 +1453,15 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
+        lap(0);
         crate::shadow::copy_back_marks(&withheld, withholding);
+        lap(1);
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
         if !read.is_empty() {
             crate::descriptor::make_read(&read);
         }
+        lap(2);
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
@@ -1458,11 +1473,13 @@ impl Host {
                 crate::memory::drop_withheld(address, len);
             }
         }
+        lap(3);
         for list in runs {
             for work in &list.deferred().after {
                 work();
             }
         }
+        lap(4);
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
@@ -3138,6 +3155,11 @@ impl Meter {
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
                 making = crate::pipeline::making()
+            );
+            let [checks, marks, views, compares, after] = [0, 1, 2, 3, 4]
+                .map(|i| COPY_BACK_PARTS[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / report_frames);
+            tracing::info!(
+                "copying back by part, ms/frame: checks and ranges {checks:.1}, marked pages                  {marks:.1}, read views made {views:.1}, compares and copies {compares:.1},                  work after {after:.1}"
             );
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (heaps, heap_used, heap_free) = crate::placement::stats();
