@@ -89,9 +89,21 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 
 impl Shader {
     fn new(stage: &'static str, bytes: &[u8]) -> Shader {
+        let hash = blake3::hash(bytes).to_hex()[..16].to_owned();
+        // Local diagnostics: `VICTORY_DUMP_SHADERS=<hash>,<hash>` and
+        // `VICTORY_DUMP_SHADERS_DIR` (outside every repo; the containers are
+        // the title's) keep those containers as the title creates them.
+        #[cfg(feature = "diagnostics")]
+        if let Ok(want) = std::env::var("VICTORY_DUMP_SHADERS")
+            && want.split(',').any(|h| h.trim() == hash)
+            && let Ok(dir) = std::env::var("VICTORY_DUMP_SHADERS_DIR")
+        {
+            let _ = std::fs::write(format!("{dir}/{hash}.bin"), bytes);
+            tracing::info!(hash, "shader container kept (VICTORY_DUMP_SHADERS)");
+        }
         Shader {
             stage,
-            hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
+            hash,
             container: bytes.to_vec(),
             #[cfg(windows)]
             translated: OnceLock::new(),

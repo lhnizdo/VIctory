@@ -227,6 +227,11 @@ pub(crate) fn begin(p: &Arc<Pending>) {
 
 /// Whether `p`'s host pipeline is made (`Some(true)`), refused or not
 /// translated (`Some(false)`), or not yet (`None`); never waits.
+/// The shaders of `p`, as host pipelines are named (`stage hash`, joined).
+pub(crate) fn names(p: &Pending) -> String {
+    p.shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect::<Vec<_>>().join(", ")
+}
+
 pub(crate) fn state(p: &Pending) -> Option<bool> {
     p.made.get().map(Option::is_some)
 }

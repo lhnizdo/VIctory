@@ -102,14 +102,18 @@ pub(crate) fn runs() -> bool {
     if decided.0 == frame {
         return decided.1;
     }
-    let states: Vec<Option<bool>> = {
+    let (states, refused_names): (Vec<Option<bool>>, Vec<String>) = {
         let mut pipelines = PIPELINES.lock().unwrap_or_else(|e| e.into_inner());
         pipelines.retain(|p| p.strong_count() > 0);
-        pipelines
+        let live: Vec<Arc<Pending>> = pipelines.iter().filter_map(Weak::upgrade).collect();
+        let states: Vec<Option<bool>> = live.iter().map(|p| make::state(p)).collect();
+        let refused = live
             .iter()
-            .filter_map(Weak::upgrade)
-            .map(|p| make::state(&p))
-            .collect()
+            .zip(&states)
+            .filter(|(_, s)| **s == Some(false))
+            .map(|(p, _)| make::names(p))
+            .collect();
+        (states, refused)
     };
     let open = all_made(&states);
     if open != decided.1 || !SAID.swap(true, Ordering::Relaxed) {
@@ -122,6 +126,7 @@ pub(crate) fn runs() -> bool {
             pipelines = states.len(),
             made,
             refused,
+            refused_pipelines = ?refused_names,
             "BVH builder {}",
             if open {
                 "runs"
