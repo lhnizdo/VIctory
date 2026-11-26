@@ -3842,16 +3842,37 @@ fn release_later(what: Box<dyn std::any::Any + Send>) {
 
 /// Diagnostics: a noted command running a shader `VICTORY_TRACE_SHADERS`
 /// names (hashes, comma-separated) is logged with what it binds: all of
-/// them in listed capture frames, the first 500 elsewhere.
+/// them in listed capture frames, the first [`trace_most`] elsewhere.
 #[cfg(feature = "diagnostics")]
 fn traced(what: &str) {
     static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // `VICTORY_TRACE_OPS=<n>`: from the first traced command on, the next n
+    // noted commands of any kind too, shortened (what lies between them).
+    static OPS: OnceLock<u64> = OnceLock::new();
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static OPS_LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let ops = *OPS.get_or_init(|| std::env::var("VICTORY_TRACE_OPS").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    if ops > 0
+        && (STARTED.load(Ordering::Relaxed) || is_traced(what) && !STARTED.swap(true, Ordering::Relaxed))
+        && OPS_LOGGED.fetch_add(1, Ordering::Relaxed) < ops
+    {
+        let short: String = what.chars().take(160).collect();
+        tracing::info!("noted op: {short}");
+    }
     if is_traced(what)
         && (crate::capture::listed(crate::queue::presented() + 1)
-            || LOGGED.fetch_add(1, Ordering::Relaxed) < 500)
+            || LOGGED.fetch_add(1, Ordering::Relaxed) < trace_most())
     {
         tracing::info!("traced command: {what}");
     }
+}
+
+/// How many traced commands are logged outside capture frames:
+/// `VICTORY_TRACE_MOST`, 500 by default (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn trace_most() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| std::env::var("VICTORY_TRACE_MOST").ok().and_then(|v| v.parse().ok()).unwrap_or(500))
 }
 
 /// The shader hashes `VICTORY_TRACE_SHADERS` lists (comma-separated;
