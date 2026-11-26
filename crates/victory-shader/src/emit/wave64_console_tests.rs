@@ -110,6 +110,11 @@ fn lowered(words: &[u32]) -> lower::Lowered {
 
 /// [`lowered`] with its own `rsrc2` (user SGPRs, group ids, LDS size).
 fn lowered_with(words: &[u32], rsrc2: u32) -> lower::Lowered {
+    lowered_sized(words, rsrc2, THREADS).expect("lower")
+}
+
+/// [`lowered_with`] for a group of `threads`, or why it does not lower.
+fn lowered_sized(words: &[u32], rsrc2: u32, threads: u32) -> Result<lower::Lowered, String> {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: true,
@@ -134,7 +139,7 @@ fn lowered_with(words: &[u32], rsrc2: u32) -> lower::Lowered {
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2,
-            threads: [THREADS, 1, 1],
+            threads: [threads, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
@@ -157,7 +162,7 @@ fn lowered_with(words: &[u32], rsrc2: u32) -> lower::Lowered {
         },
         false,
     )
-    .expect("lower")
+    .map_err(|e| format!("{e:?}"))
 }
 
 fn shader(lowered: lower::Lowered) -> HostShader {
@@ -887,4 +892,126 @@ fn a_wave64_waterfall_runs_per_half_beside_the_atomic_optimizer() {
         })
         .collect();
     assert_eq!(out[64..128], want[..], "each lane's own buffer");
+}
+
+/// Threads of the prefix-sum group: four console waves.
+const SUM_THREADS: u32 = 256;
+
+/// A block-wide prefix sum's second step, as the console's BVH builder runs
+/// it: console wave k (t >> 6) writes its total 10 + k to LDS at 4k, a
+/// barrier, then a loop over the earlier waves adds their totals, the sum so
+/// far carried in a scalar by `v_readfirstlane_b32` (every lane holds it
+/// alike: scalars and LDS read at a scalar address no one writes after the
+/// barrier). Stores 10k + k(k - 1) / 2. (A lane count, unused, as the
+/// builder's scan makes one: code that reads lanes is split.) `write_after`: an LDS write after
+/// the loop (the read is then not known to be alike in both halves).
+fn wave_totals_prefix(write_after: bool) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0xD765_000A,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v10, -1, 0 (console lanes: the split)
+        0x2C0E_0086, // v_lshrrev_b32 v7, 6, v0 (the console wave)
+        0x4A10_0E8A, // v_add_nc_u32 v8, 10, v7
+        0x3412_0E82, // v_lshlrev_b32 v9, 2, v7
+        0xD834_0000,
+        0x0000_0809, // ds_write_b32 v9, v8
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBF8A_0000, // s_barrier
+        0x7E10_0280, // v_mov_b32 v8, 0
+        0xBE80_047E, // s_mov_b64 s[0:1], exec
+        0x7DAA_0E80, // v_cmpx_ne_u32 exec, 0, v7
+        0xBF88_0014, // s_cbranch_execz the end
+        0xBE82_047E, // s_mov_b64 s[2:3], exec
+        0xBE86_047E, // s_mov_b64 s[6:7], exec
+        0xBE92_0380, // s_mov_b32 s18, 0
+        0xBE91_0380, // s_mov_b32 s17, 0
+        0xBF82_0003, // s_branch the head
+        0xBF80_0000, // s_nop 0 (the console compiler aligns the loop)
+        0x87FE_0610, // the latch: s_and_b64 exec, s[16:17], s[6:7]
+        0x7E22_0508, // v_readfirstlane_b32 s17, v8
+        0x8F10_8212, // the head: s_lshl_b32 s16, s18, 2
+        0x8112_8112, // s_add_i32 s18, s18, 1
+        0x7E10_0210, // v_mov_b32 v8, s16
+        0xD8D8_0000,
+        0x0800_0008, // ds_read_b32 v8, v8
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x4A10_1011, // v_add_nc_u32 v8, s17, v8
+        0xBE90_047E, // s_mov_b64 s[16:17], exec
+        0x7DA4_0E12, // v_cmpx_eq_u32 exec, s18, v7
+        0xBF80_0000, // s_nop 0
+        0x8A86_7E06, // s_andn2_b64 s[6:7], s[6:7], exec
+        0xBF85_FFF2, // s_cbranch_scc1 the latch
+        0xBEFE_0400, // the end: s_mov_b64 exec, s[0:1]
+        0x7E02_0308, // v_mov_b32 v1, v8
+    ]);
+    if write_after {
+        w.extend([
+            0xD834_0000,
+            0x0000_0809, // ds_write_b32 v9, v8
+        ]);
+    }
+    w.extend_from_slice(EPILOGUE);
+    w
+}
+
+/// The prefix sum's loop of first-lane reads runs in the plain split: the
+/// value read is alike in every lane of both halves, so each lane's own
+/// stands in for the console wave's first lane, and no exchange (which
+/// every thread would have to reach once, not once per loop turn) is made.
+#[test]
+fn a_first_lane_read_of_lds_settled_by_a_barrier_needs_no_exchange() {
+    let words = wave_totals_prefix(false);
+    let lowered = lowered_sized(&words, 1 << 1 | 1 << 15, SUM_THREADS)
+        .unwrap_or_else(|e| panic!("the prefix sum is refused: {e}"));
+    let shader = shader(lowered);
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .unwrap_or_else(|e| panic!("DXIL validation failed: {e}"));
+    }
+    let views = [View::RawUav(SUM_THREADS)];
+    let want: Vec<u32> = (0..SUM_THREADS)
+        .map(|t| {
+            let k = t >> 6;
+            10 * k + k * k.saturating_sub(1) / 2
+        })
+        .collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed (a hang?): {e}"));
+        assert_eq!(out[0][..SUM_THREADS as usize], want[..], "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// An LDS write after the barrier may part what the two halves of a console
+/// wave read, at their different times: the first-lane read is then not
+/// known alike, and the split refuses it in the loop.
+#[test]
+fn a_first_lane_read_of_lds_written_after_the_barrier_is_refused() {
+    let words = wave_totals_prefix(true);
+    let e = lowered_sized(&words, 1 << 1 | 1 << 15, SUM_THREADS)
+        .err()
+        .expect("an LDS read written after its barrier taken as alike");
+    assert!(e.contains("not every thread"), "{e}");
 }

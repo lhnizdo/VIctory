@@ -162,6 +162,24 @@ impl<'a> Lower<'a> {
                 }
                 continue;
             }
+            // An LDS read at an address made of scalars, after a barrier
+            // past which the program writes no LDS: the same dword in every
+            // lane, and in both halves of a console wave (which read at
+            // different times, but each after every thread of the group
+            // passed the barrier). A block-wide prefix sum reads the waves'
+            // totals so (the BVH builder's).
+            if let Fields::Ds { addr: Some(Operand::Vector { reg, dwords: 1 }), gds: false, .. } = w.fields
+                && w.name() == "ds_read_b32"
+            {
+                if !self.lds_settled(db, di, &dominates) {
+                    return Some(format!("an LDS read at {:#x} the program may write after", w.machine.offset));
+                }
+                match w.read(Reg::V(reg)) {
+                    Some(m) => want.push((m, db, Some(di))),
+                    None => return Some(format!("no read of v{reg} at {:#x}", w.machine.offset)),
+                }
+                continue;
+            }
             let Fields::Valu(wv) = &w.fields else {
                 return Some(format!(
                     "made by non-VALU {} at {:#x}",
@@ -228,6 +246,49 @@ impl<'a> Lower<'a> {
             }
         }
         None
+    }
+
+    /// Whether an `s_barrier` comes before instruction `i` of IR block `b`
+    /// (earlier in it, or in a block dominating it) with no write of LDS
+    /// reachable after it: what `i` reads of LDS then stays as it is.
+    fn lds_settled(&self, b: usize, i: usize, dominates: &dyn Fn(usize, usize) -> bool) -> bool {
+        let p = self.x.p;
+        let writes = |inst: &crate::ir::Inst| match &inst.fields {
+            Fields::Ds { .. } => {
+                let n = inst.name();
+                !(n.starts_with("ds_read") || matches!(n, "ds_swizzle_b32" | "ds_permute_b32" | "ds_bpermute_b32"))
+            }
+            Fields::Buffer { lds, .. } => *lds,
+            _ => false,
+        };
+        let mut succ = vec![Vec::new(); p.blocks.len()];
+        for (k, blk) in p.blocks.iter().enumerate() {
+            for &q in &blk.preds {
+                succ[q].push(k);
+            }
+        }
+        let barriers = p.blocks.iter().enumerate().flat_map(|(k, blk)| {
+            blk.insts.iter().enumerate().filter(|(_, x)| x.name() == "s_barrier").map(move |(j, _)| (k, j))
+        });
+        barriers
+            .filter(|&(k, j)| if k == b { j < i } else { dominates(k, b) })
+            .any(|(k, j)| {
+                if p.blocks[k].insts[j + 1..].iter().any(writes) {
+                    return false;
+                }
+                let mut seen = vec![false; p.blocks.len()];
+                let mut todo = succ[k].clone();
+                while let Some(q) = todo.pop() {
+                    if std::mem::replace(&mut seen[q], true) {
+                        continue;
+                    }
+                    if p.blocks[q].insts.iter().any(writes) {
+                        return false;
+                    }
+                    todo.extend(succ[q].iter().copied());
+                }
+                true
+            })
     }
 }
 
