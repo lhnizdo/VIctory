@@ -285,7 +285,7 @@ pub(crate) fn held_back(this: This) -> bool {
         return true;
     }
     #[cfg(feature = "diagnostics")]
-    if builder::runs() && builder::past_limit(&shaders_of(this)) {
+    if builder::runs() && (builder::stopped() || builder::past_limit(&shaders_of(this))) {
         return true;
     }
     !builder::runs()
@@ -301,6 +301,12 @@ pub(crate) fn barrier_after(this: This) -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_BUILDER_BARRIERS").is_ok_and(|v| v == "1"))
         && !this.is_null()
         && pipeline(this).builder
+}
+
+/// Holds back the rest of this frame's builder dispatches (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn stop_builder_this_frame() {
+    builder::stop_this_frame();
 }
 
 /// Whether this is one of the BVH builder's pipelines (diagnostics).

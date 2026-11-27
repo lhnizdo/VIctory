@@ -1491,3 +1491,247 @@ fn equality_exit_waterfall_dxil_written() {
     let Some(out) = std::env::var_os("VICTORY_WATERFALL_DXIL") else { return };
     std::fs::write(out, lowered(&equality_exit_waterfall(false)).dxil).expect("written");
 }
+
+/// Local diagnostics: for `VICTORY_GUARDS_CONTAINER`'s compute program, each
+/// block in the byte range `VICTORY_GUARDS_RANGE` (`from-to`, hex): its
+/// exit, what holds in lanes entering it, and each instruction's guard, as
+/// formulas over the atoms (with the values each instruction writes).
+#[test]
+fn one_container_guards_written() {
+    let (Some(path), Some(range)) =
+        (std::env::var_os("VICTORY_GUARDS_CONTAINER"), std::env::var("VICTORY_GUARDS_RANGE").ok())
+    else {
+        return;
+    };
+    let (from, to) = range.split_once('-').expect("from-to");
+    let (from, to) = (usize::from_str_radix(from, 16).unwrap(), usize::from_str_radix(to, 16).unwrap());
+    let bytes = std::fs::read(path).expect("container");
+    let c = crate::dxbc::Container::parse(&bytes).expect("container");
+    let dxil = c.part(crate::dxbc::FourCC::DXIL).or(c.part(crate::dxbc::FourCC::ACCC)).expect("dxil");
+    let native = crate::native_programs(dxil.data)
+        .expect("programs")
+        .into_iter()
+        .find(|p| p.stage == HwStage::Cs)
+        .expect("compute");
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir");
+    let st = structure::structure(&p).expect("structure");
+    fn show(st: &structure::Structured, b: structure::Bool, budget: &mut usize) -> String {
+        if b == structure::Bool::TRUE {
+            return "T".into();
+        }
+        if b == structure::Bool::FALSE {
+            return "F".into();
+        }
+        if *budget == 0 {
+            return "…".into();
+        }
+        *budget -= 1;
+        let (a, lo, hi) = st.bools.node(b).expect("a node");
+        let a = format!("{a:?}").replace("Value(", "").replace(')', "");
+        match (lo, hi) {
+            (structure::Bool::FALSE, structure::Bool::TRUE) => a,
+            (structure::Bool::TRUE, structure::Bool::FALSE) => format!("!{a}"),
+            _ => format!("({a} ? {} : {})", show(st, hi, budget), show(st, lo, budget)),
+        }
+    }
+    for (bi, block) in p.blocks.iter().enumerate() {
+        if block.offset < from || block.offset > to {
+            continue;
+        }
+        let mut n = 40;
+        eprintln!("block {bi} @{:#x} exit {:?} reach {}", block.offset, st.exits[bi], show(&st, st.reach[bi], &mut n));
+        if let structure::LaneExit::Branch { when, .. } = st.exits[bi] {
+            let mut n = 40;
+            eprintln!("  when {}", show(&st, when, &mut n));
+        }
+        if let Some(w) = st.whens[bi] {
+            let mut n = 40;
+            eprintln!("  whens {}", show(&st, w, &mut n));
+        }
+        for (ii, inst) in block.insts.iter().enumerate() {
+            let mut n = 40;
+            let g = st.guards[bi][ii].map_or("-".into(), |g| show(&st, g, &mut n));
+            let w: Vec<String> = inst.writes.iter().map(|(r, v)| format!("{r:?}={v:?}")).collect();
+            eprintln!("  {} guard {g} writes {}", inst.name(), w.join(" ").replace("Value(", "").replace(')', ""));
+        }
+    }
+}
+
+/// Local check, no game data in the repo: replays a dispatch the game run
+/// captured (`VICTORY_BUILDER_CAPTURE`): `VICTORY_REPLAY_CONTAINER` the
+/// program's container, `VICTORY_REPLAY_DIR` the capture folder and
+/// `VICTORY_REPLAY_K` the dispatch. Every view it captured is mapped at its
+/// own title address (64 KiB pages into one memory view, up to
+/// `VICTORY_REPLAY_MB` MiB of each view, default 8), its root views and
+/// constants given as the game gave them. It must complete.
+#[test]
+fn one_capture_replays() {
+    let (Some(container), Some(dir)) =
+        (std::env::var_os("VICTORY_REPLAY_CONTAINER"), std::env::var_os("VICTORY_REPLAY_DIR"))
+    else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let k: u32 = std::env::var("VICTORY_REPLAY_K").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let cap: usize = std::env::var("VICTORY_REPLAY_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(8) << 20;
+    let meta = std::fs::read_to_string(dir.join(format!("{k}.txt"))).expect("capture meta");
+    let (mut groups, mut views, mut constants) = ([1u32; 3], Vec::new(), std::collections::HashMap::new());
+    for line in meta.lines() {
+        let w: Vec<&str> = line.split_whitespace().collect();
+        match w.first().copied() {
+            Some("groups") => {
+                for i in 0..3 {
+                    groups[i] = w[1 + i].parse().unwrap();
+                }
+            }
+            Some("view") => {
+                let slot: u32 = w[1].parse().unwrap();
+                let at = u64::from_str_radix(w[2].trim_start_matches("0x"), 16).unwrap();
+                views.push((slot, at));
+            }
+            Some("constants") => {
+                let slot: u32 = w[1].parse().unwrap();
+                let list = line.split_once('[').unwrap().1.trim_end_matches(']');
+                let c: Vec<u32> = list.split(',').map(|x| u32::from_str_radix(x.trim(), 16).unwrap()).collect();
+                constants.insert(slot, c);
+            }
+            _ => {}
+        }
+    }
+    // Pages: every 64 KiB page a captured view covers, in one memory view.
+    let mut pages: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+    let mut bytes_of = Vec::new();
+    for &(slot, at) in &views {
+        let Ok(b) = std::fs::read(dir.join(format!("{k}-{slot}.bin"))) else { continue };
+        let b = b[..b.len().min(cap)].to_vec();
+        let mut p = at & !0xFFFF;
+        while p < at + b.len() as u64 {
+            let n = pages.len();
+            pages.entry(p).or_insert(n);
+            p += 0x1_0000;
+        }
+        bytes_of.push((at, b));
+    }
+    let mut memory = vec![0u32; pages.len() * 0x4000];
+    let mut image = vec![0u8; pages.len() * 0x1_0000];
+    for (at, b) in &bytes_of {
+        for (i, byte) in b.iter().enumerate() {
+            let a = at + i as u64;
+            let slot = pages[&(a & !0xFFFF)];
+            image[slot * 0x1_0000 + (a & 0xFFFF) as usize] = *byte;
+        }
+    }
+    for (i, w) in image.chunks(4).enumerate() {
+        memory[i] = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+    }
+    // The page table: level 1 by 256 MiB region, then blocks of 4096
+    // entries (block 0: the null pair for misses).
+    let mut table = vec![0u32; 4096];
+    let mut blocks: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+    for &p in pages.keys() {
+        let l1 = ((p >> 32) << 4 | (p & 0xFFFF_FFFF) >> 28) as usize;
+        let n = blocks.len() as u32 + 1;
+        let b = *blocks.entry(l1).or_insert(n);
+        table[l1] = b;
+    }
+    for _ in 0..(blocks.len() + 1) * 4096 {
+        table.extend([2, 0]);
+    }
+    for (&p, &slot) in &pages {
+        let l1 = ((p >> 32) << 4 | (p & 0xFFFF_FFFF) >> 28) as usize;
+        let e = 4096 + 2 * (blocks[&l1] as usize * 4096 + ((p as u32) >> 16 & 0xFFF) as usize);
+        let start = (p as u32).wrapping_sub((slot * 0x1_0000) as u32);
+        table[e..e + 2].copy_from_slice(&[0, start]);
+    }
+    let bytes = std::fs::read(container).expect("container");
+    let shader = super::translate_with(&bytes, super::Options { view_marks: true }).expect("translates");
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        ud[u.index as usize] = match u.root {
+            RootType::Descriptor => {
+                let at = views.iter().find(|v| v.0 == u.slot as u32).map_or(0, |v| v.1);
+                (at >> (32 * u.dword)) as u32
+            }
+            RootType::Constants => constants.get(&(u.slot as u32)).and_then(|c| c.get(u.dword as usize)).copied().unwrap_or(0),
+            _ => 0,
+        };
+    }
+    eprintln!("replay {k}: groups {groups:?}, {} views, {} pages, user data {ud:x?}", views.len(), pages.len());
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+    let started = std::time::Instant::now();
+    let out = host.dispatch(
+        &root,
+        &pso,
+        &Dispatch {
+            roots: vec![
+                (0, Root::Constants(ud)),
+                (1, Root::View { srv: true, data: table.clone() }),
+                (2, Root::Uav(((blocks.len() + 1) * 4096 / 32) as u32)),
+            ],
+            views: &[View::Memory(&memory), View::Pair, View::NullPair, View::Pair],
+            samplers: &[],
+            groups,
+        },
+    );
+    match out {
+        Ok(out) => {
+            eprintln!("replay {k}: completed in {:?}", started.elapsed());
+            // What changed, per captured view: counts, and the largest new
+            // values of dwords that were 0 (counters).
+            let after = &out[0];
+            // `VICTORY_REPLAY_DUMP`: each view's bytes before and after.
+            if let Some(d) = std::env::var_os("VICTORY_REPLAY_DUMP") {
+                let d = std::path::PathBuf::from(d);
+                let _ = std::fs::create_dir_all(&d);
+                for &(slot, at) in &views {
+                    let Some((_, b)) = bytes_of.iter().find(|x| x.0 == at) else { continue };
+                    let words = |m: &[u32]| -> Vec<u8> {
+                        (0..b.len() / 4)
+                            .flat_map(|i| {
+                                let a = at + 4 * i as u64;
+                                m[(pages[&(a & !0xFFFF)] * 0x1_0000 + (a & 0xFFFF) as usize) / 4].to_le_bytes()
+                            })
+                            .collect()
+                    };
+                    let _ = std::fs::write(d.join(format!("{slot}-after.bin")), words(after));
+                    let _ = std::fs::write(d.join(format!("{slot}-before.bin")), words(&memory));
+                }
+            }
+            for (at, b) in &bytes_of {
+                let (mut changed, mut from_zero) = (0, Vec::new());
+                for i in (0..b.len() / 4).map(|i| i * 4) {
+                    let a = at + i as u64;
+                    let w = (pages[&(a & !0xFFFF)] * 0x1_0000 + (a & 0xFFFF) as usize) / 4;
+                    if after[w] != memory[w] {
+                        changed += 1;
+                        if memory[w] == 0 {
+                            from_zero.push((after[w], i / 4));
+                        }
+                    }
+                }
+                let bins = [1u32, 2, 3, 4, 10, 100, 301, 1000, u32::MAX - 1];
+                let mut hist = vec![0; bins.len() + 1];
+                for &(v, _) in &from_zero {
+                    hist[bins.iter().position(|&b| v < b).unwrap_or(bins.len())] += 1;
+                }
+                eprintln!("  view at {at:#x}: from 0 to <1,<2,<3,<4,<10,<100,<301,<1000,<max-1,rest: {hist:?}");
+                let mut mid: Vec<(u32, usize)> = from_zero.iter().copied().filter(|x| x.0 > 2 && x.0 < 0xFFFF_0000).collect();
+                mid.sort_unstable_by(|x, y| y.cmp(x));
+                eprintln!("    largest below -1: {:?}", &mid[..mid.len().min(10)]);
+                from_zero.sort_unstable_by(|x, y| y.cmp(x));
+                let small = from_zero.iter().filter(|x| x.0 <= 2).count();
+                eprintln!(
+                    "  view at {at:#x}: {changed} dwords changed, {} from 0 ({small} to 1 or 2); largest {:?}",
+                    from_zero.len(),
+                    &from_zero[..from_zero.len().min(8)]
+                );
+            }
+        }
+        Err(e) => panic!("replay {k}: failed after {:?}: {e}", started.elapsed()),
+    }
+}

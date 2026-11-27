@@ -1467,9 +1467,27 @@ impl State {
         if groups[0] * groups[1] * groups[2] < min {
             return;
         }
-        let k = TAKEN.fetch_add(1, Ordering::Relaxed);
-        if k >= 64 {
+        // `VICTORY_BUILDER_CAPTURE_GROUPS`: only dispatches of exactly that
+        // many groups; `_MAX`: that many at most (64); `_STOP=1`: the rest
+        // of the frame's builder held back, so what it read stays as it was.
+        static EXACT: std::sync::OnceLock<(Option<u32>, u64, bool)> = std::sync::OnceLock::new();
+        let (exact, max, stop) = *EXACT.get_or_init(|| {
+            let n = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok());
+            (
+                n("VICTORY_BUILDER_CAPTURE_GROUPS").map(|v| v as u32),
+                n("VICTORY_BUILDER_CAPTURE_MAX").unwrap_or(64),
+                std::env::var("VICTORY_BUILDER_CAPTURE_STOP").is_ok_and(|v| v == "1"),
+            )
+        });
+        if exact.is_some_and(|e| e != groups[0] * groups[1] * groups[2]) {
             return;
+        }
+        let k = TAKEN.fetch_add(1, Ordering::Relaxed);
+        if k >= max {
+            return;
+        }
+        if stop {
+            crate::pipeline::stop_builder_this_frame();
         }
         let frame = crate::frame::current();
         let mut meta = format!("frame {frame}

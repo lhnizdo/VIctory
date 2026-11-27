@@ -148,6 +148,23 @@ pub(crate) fn past_limit(shaders: &str) -> bool {
     seen.1 > limit
 }
 
+/// The frame whose builder stops after a captured dispatch (diagnostics,
+/// `VICTORY_BUILDER_CAPTURE_STOP`): what it read stays as it found it.
+#[cfg(feature = "diagnostics")]
+static STOPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Holds back the rest of this frame's builder dispatches (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn stop_this_frame() {
+    STOPPED.store(crate::frame::current(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`stop_this_frame`] was called this frame (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn stopped() -> bool {
+    STOPPED.load(std::sync::atomic::Ordering::Relaxed) == crate::frame::current()
+}
+
 /// The frame [`runs`] last decided for, and its decision.
 static DECIDED: Mutex<(u64, bool)> = Mutex::new((u64::MAX, true));
 
