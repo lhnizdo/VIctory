@@ -1102,6 +1102,8 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         self.check_tree(list);
+        #[cfg(feature = "diagnostics")]
+        self.capture_inputs(list, [x, y, z]);
         // The acceleration-structure builder runs whole or not at all
         // (`pipeline::builder`).
         if crate::pipeline::held_back(self.pipeline as This) {
@@ -1434,6 +1436,79 @@ impl State {
     /// Run with the refit dropped (`VICTORY_BUILDER_DROP`), or the device
     /// hangs before the list ends.
     #[cfg(feature = "diagnostics")]
+    /// `VICTORY_BUILDER_CAPTURE=<hash>` and `VICTORY_BUILDER_CAPTURE_DIR`
+    /// (diagnostics): for that program's first 64 dispatches, its group
+    /// count, root constants and root views (`<k>.txt`), and each view's
+    /// bytes once the list has run, up to 32 MB (`<k>-<slot>.bin`). With the
+    /// program dropped (`VICTORY_BUILDER_DROP`), they are what it would read.
+    fn capture_inputs(&self, list: &HostList, groups: [u32; 3]) {
+        static WANT: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+        static TAKEN: AtomicU64 = AtomicU64::new(0);
+        let (want, dir) = WANT.get_or_init(|| {
+            (
+                std::env::var("VICTORY_BUILDER_CAPTURE").unwrap_or_default(),
+                std::env::var("VICTORY_BUILDER_CAPTURE_DIR").unwrap_or_default(),
+            )
+        });
+        if want.is_empty() || dir.is_empty() || !crate::pipeline::shaders_of(self.pipeline as This).contains(want.as_str()) {
+            return;
+        }
+        let k = TAKEN.fetch_add(1, Ordering::Relaxed);
+        if k >= 64 {
+            return;
+        }
+        let frame = crate::frame::current();
+        let mut meta = format!("frame {frame}
+groups {} {} {}
+", groups[0], groups[1], groups[2]);
+        let mut views = Vec::new();
+        for (slot, root) in self.roots_ref(true).iter().enumerate() {
+            match root {
+                Root::View(a) => {
+                    meta.push_str(&format!("view {slot} {a:#x}
+"));
+                    views.push((slot, *a));
+                }
+                Root::Constants(c) => meta.push_str(&format!("constants {slot} {c:x?}
+")),
+                Root::Table(t) => meta.push_str(&format!("table {slot} {t:#x}
+")),
+                Root::None => {}
+            }
+        }
+        let dir = std::path::PathBuf::from(dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join(format!("{k}.txt")), &meta);
+        let done = std::sync::atomic::AtomicBool::new(false);
+        list.defer_after(move || {
+            if done.swap(true, Ordering::Relaxed) {
+                return;
+            }
+            let mut sizes = String::new();
+            for &(slot, a) in &views {
+                let Some(s) = crate::shadow::find(a, 4) else {
+                    sizes.push_str(&format!("bytes {slot} none
+"));
+                    continue;
+                };
+                let n = (s.left(a).min(32 << 20) / 4) as usize;
+                let Some(words) = s.dwords(a, n) else {
+                    sizes.push_str(&format!("bytes {slot} unreadable
+"));
+                    continue;
+                };
+                let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                let _ = std::fs::write(dir.join(format!("{k}-{slot}.bin")), &bytes);
+                sizes.push_str(&format!("bytes {slot} {}
+", bytes.len()));
+            }
+            let _ = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.join(format!("{k}.txt")))
+                .and_then(|mut f| std::io::Write::write_all(&mut f, sizes.as_bytes()));
+        });
+    }
+
     fn check_tree(&self, list: &HostList) {
         static WANT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         static CHECKED: AtomicU64 = AtomicU64::new(0);
