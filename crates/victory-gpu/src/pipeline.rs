@@ -291,6 +291,18 @@ pub(crate) fn held_back(this: This) -> bool {
     !builder::runs()
 }
 
+/// Whether a dispatch of this pipeline is followed by a barrier on every
+/// shader write (`VICTORY_BUILDER_BARRIERS=1`, the builder's programs only;
+/// diagnostics): whether its dispatches the title leaves unordered hang
+/// when they overlap.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn barrier_after(this: This) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_BUILDER_BARRIERS").is_ok_and(|v| v == "1"))
+        && !this.is_null()
+        && pipeline(this).builder
+}
+
 /// A title DLL was mapped at `base`, `size` bytes (the acceleration-
 /// structure builder's pipelines are known by its image).
 #[cfg(windows)]

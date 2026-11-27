@@ -1389,3 +1389,18 @@ fn one_container_radix_histogram_matches_its_reference() {
         eprintln!("bits {shift}..: 256 counts match");
     }
 }
+
+/// Writes the DXIL `VICTORY_DXIL_CONTAINER`'s program translates to (with
+/// 32-lane host waves) to `VICTORY_DXIL_OUT`, for `dxc -dumpbin` (local).
+#[test]
+fn one_container_dxil_written() {
+    let (Some(path), Some(out)) = (std::env::var_os("VICTORY_DXIL_CONTAINER"), std::env::var_os("VICTORY_DXIL_OUT"))
+    else {
+        return;
+    };
+    let bytes = std::fs::read(path).expect("container");
+    super::set_host_wave64(false);
+    // As the game makes it (`shader_cache`).
+    let shader = super::translate_with(&bytes, super::Options { view_marks: true }).expect("translates");
+    std::fs::write(out, &shader.dxil).expect("written");
+}

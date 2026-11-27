@@ -1139,6 +1139,18 @@ impl State {
         unsafe { list.list.Dispatch(x, y, z) };
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::barrier_after(self.pipeline as This) {
+            let barrier = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+                },
+            };
+            // SAFETY: an open list; no resource named.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
