@@ -110,25 +110,41 @@ pub(crate) fn dropped_by_env(shaders: &str) -> bool {
 }
 
 /// Local diagnostics, `VICTORY_BUILDER_UPTO=<n>`: only the builder's first
-/// `n` dispatches of a frame run, the rest are dropped. A list cut short
+/// `n` dispatches of a frame run, the rest are dropped; with
+/// `VICTORY_BUILDER_UPTO_STEP=<s>`, `n + s * k` in the k-th frame it runs. A list cut short
 /// finishes, so its per-command times (`VICTORY_GPU_TIMING` with
 /// `VICTORY_D3D12_DRED`) show where the
 /// builder's time goes before the driver resets a list that runs too long.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn past_limit() -> bool {
-    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    static SEEN: Mutex<(u64, u64)> = Mutex::new((u64::MAX, 0));
-    let Some(limit) = *LIMIT.get_or_init(|| {
-        std::env::var("VICTORY_BUILDER_UPTO").ok().and_then(|v| v.trim().parse().ok())
+pub(crate) fn past_limit(shaders: &str) -> bool {
+    static LIMIT: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    // (frame, dispatches this frame, builder frames so far, programs past
+    // the previous frame's cut).
+    static SEEN: Mutex<(u64, u64, u64, Vec<String>)> = Mutex::new((u64::MAX, 0, 0, Vec::new()));
+    let Some((base, step)) = *LIMIT.get_or_init(|| {
+        let n = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<u64>().ok());
+        n("VICTORY_BUILDER_UPTO").map(|b| (b, n("VICTORY_BUILDER_UPTO_STEP").unwrap_or(0)))
     }) else {
         return false;
     };
     let frame = crate::frame::current();
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if seen.0 != frame {
-        *seen = (frame, 0);
+        let k = if seen.0 == u64::MAX { 0 } else { seen.2 + 1 };
+        *seen = (frame, 0, k, Vec::new());
     }
     seen.1 += 1;
+    // `VICTORY_BUILDER_UPTO_STEP`: each builder frame runs `step` more, so
+    // one run bisects: the frame a hang stops at names what its cut added.
+    let limit = base + step * seen.2;
+    let from = limit.saturating_sub(step);
+    let name: String = shaders.split(['[', ']', ',']).find(|p| p.contains("compute")).unwrap_or(shaders).trim().to_owned();
+    if step > 0 && seen.1 > from && seen.1 <= limit && !seen.3.contains(&name) {
+        seen.3.push(name);
+    }
+    if seen.1 == limit {
+        tracing::warn!(frame, builder_frame = seen.2, cut = limit, added_after = from, programs = ?seen.3, "builder cut");
+    }
     seen.1 > limit
 }
 

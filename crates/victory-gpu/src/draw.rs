@@ -1429,8 +1429,26 @@ impl State {
         if want.is_empty() || !crate::pipeline::shaders_of(self.pipeline as This).contains(want.as_str()) {
             return;
         }
+        // `VICTORY_BUILDER_CHECK_AT=submit`: every refit's tree as the GPU
+        // will find it (its host copy at submission), logged when wrong
+        // (and every 200th): a frame that hangs never gets to `defer_after`.
+        static AT_SUBMIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        let at_submit = *AT_SUBMIT.get_or_init(|| std::env::var("VICTORY_BUILDER_CHECK_AT").is_ok_and(|v| v == "submit"));
         let k = CHECKED.fetch_add(1, Ordering::Relaxed);
-        if k >= 40 {
+        if k >= 40 && !at_submit {
+            return;
+        }
+        let frame = crate::frame::current();
+        // At submission a first build's trees are not written yet (its
+        // earlier stages run in the same list): from its next frame on.
+        static FIRST: AtomicU64 = AtomicU64::new(u64::MAX);
+        let first = FIRST.fetch_min(frame, Ordering::Relaxed).min(frame);
+        static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+        if at_submit && LAST.swap(frame, Ordering::Relaxed) != frame {
+            tracing::info!(k, frame, first, "tree check: a frame's first refit");
+        }
+        if at_submit && frame == first {
             return;
         }
         let roots = self.roots_ref(true);
@@ -1442,19 +1460,27 @@ impl State {
             tracing::info!(k, "tree check: the refit's root views are not all set");
             return;
         };
-        list.defer_after(move || {
+        let check = move || {
+            let say = |bad: bool| bad || !at_submit || k % 200 == 0;
+            let room = || LOGGED.fetch_add(1, Ordering::Relaxed) < 80;
             let read = |a: u64, n: usize| crate::shadow::find(a, 4 * n as u64).and_then(|s| s.dwords(a, n));
             let Some(n) = read(header + 12, 1).map(|v| v[0] as usize) else {
-                tracing::info!(k, header = format_args!("{header:#x}"), "tree check: no host copy of the header");
+                if say(true) && room() {
+                    tracing::info!(k, frame, header = format_args!("{header:#x}"), "tree check: no host copy of the header");
+                }
                 return;
             };
             if n < 2 || n > 1 << 22 {
-                tracing::info!(k, n, "tree check: leaf count out of range");
+                if say(true) && room() {
+                    tracing::info!(k, frame, n, header = format_args!("{header:#x}"), "tree check: leaf count out of range");
+                }
                 return;
             }
             let nodes = 2 * n - 1;
             let (Some(up), Some(kids)) = (read(parents, nodes), read(children, 2 * (n - 1))) else {
-                tracing::info!(k, n, "tree check: no host copy of the parents or children");
+                if say(true) && room() {
+                    tracing::info!(k, frame, n, "tree check: no host copy of the parents or children");
+                }
                 return;
             };
             // The root is node 0 (the refit leaves its loop there), whatever
@@ -1492,20 +1518,32 @@ impl State {
             let back = (0..n - 1)
                 .filter(|&i| (0..2).any(|c| kids.get(2 * i + c).is_some_and(|&ch| (ch as usize) < nodes && up[ch as usize] != i as u32)))
                 .count();
+            let parent_zero = (1..nodes).filter(|&v| up[v] == 0).count();
+            let bad = roots_seen != 1 || out_of_range > 0 || cycles > 0 || back > 0 || parent_zero != 2;
+            if !say(bad) || !room() {
+                return;
+            }
             tracing::info!(
                 k,
+                frame,
+                at_submit,
                 n,
                 roots = roots_seen,
                 out_of_range,
                 cycles,
                 first_cycle = ?first_cycle,
                 children_not_pointing_back = back,
-                parent_zero = (1..nodes).filter(|&v| up[v] == 0).count(),
+                parent_zero,
                 deepest,
                 parent_head = ?&up[..up.len().min(8)],
                 "tree check"
             );
-        });
+        };
+        if at_submit {
+            list.defer_host(check);
+        } else {
+            list.defer_after(check);
+        }
     }
 
     /// In a listed frame: each small buffer (64 bytes at most) the draw's

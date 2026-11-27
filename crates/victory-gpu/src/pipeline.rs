@@ -285,7 +285,7 @@ pub(crate) fn held_back(this: This) -> bool {
         return true;
     }
     #[cfg(feature = "diagnostics")]
-    if builder::runs() && builder::past_limit() {
+    if builder::runs() && builder::past_limit(&shaders_of(this)) {
         return true;
     }
     !builder::runs()
