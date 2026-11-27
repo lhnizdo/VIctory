@@ -1459,6 +1459,14 @@ impl State {
         if want.is_empty() || dir.is_empty() || !crate::pipeline::shaders_of(self.pipeline as This).contains(want.as_str()) {
             return;
         }
+        // `VICTORY_BUILDER_CAPTURE_MIN_GROUPS`: only dispatches that big.
+        static MIN: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let min = *MIN.get_or_init(|| {
+            std::env::var("VICTORY_BUILDER_CAPTURE_MIN_GROUPS").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        });
+        if groups[0] * groups[1] * groups[2] < min {
+            return;
+        }
         let k = TAKEN.fetch_add(1, Ordering::Relaxed);
         if k >= 64 {
             return;
