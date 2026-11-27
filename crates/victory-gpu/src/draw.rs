@@ -1142,6 +1142,11 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_builder(self.pipeline as This) {
+            let this = self.pipeline as This;
+            crate::progress::after_dispatch(list, || format!("{} {x}x{y}x{z}", crate::pipeline::shaders_of(this)));
+        }
+        #[cfg(feature = "diagnostics")]
         if crate::pipeline::barrier_after(self.pipeline as This) {
             let barrier = D3D12_RESOURCE_BARRIER {
                 Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -1441,6 +1446,7 @@ impl State {
     /// count, root constants and root views (`<k>.txt`), and each view's
     /// bytes once the list has run, up to 32 MB (`<k>-<slot>.bin`). With the
     /// program dropped (`VICTORY_BUILDER_DROP`), they are what it would read.
+    #[cfg(feature = "diagnostics")]
     fn capture_inputs(&self, list: &HostList, groups: [u32; 3]) {
         static WANT: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
         static TAKEN: AtomicU64 = AtomicU64::new(0);
@@ -1509,6 +1515,7 @@ groups {} {} {}
         });
     }
 
+    #[cfg(feature = "diagnostics")]
     fn check_tree(&self, list: &HostList) {
         static WANT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         static CHECKED: AtomicU64 = AtomicU64::new(0);

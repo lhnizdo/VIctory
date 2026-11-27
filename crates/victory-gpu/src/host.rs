@@ -1412,8 +1412,9 @@ impl Host {
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
             fail(format_args!(
-                "host GPU device removed after a submission of {} lists{}{}{}",
+                "host GPU device removed after a submission of {} lists{}{}{}{}",
                 runs.len(),
+                progress_report(),
                 self.removal_data(runs),
                 last_notes(runs),
                 removed_during(runs, removed_in)
@@ -4334,4 +4335,12 @@ mod present_plane_tests {
         // Premultiplied half-blue over opaque red.
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
     }
+}
+
+/// Our builder breadcrumbs (`crate::progress`), diagnostics builds.
+fn progress_report() -> String {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    return crate::progress::report();
+    #[allow(unreachable_code)]
+    String::new()
 }

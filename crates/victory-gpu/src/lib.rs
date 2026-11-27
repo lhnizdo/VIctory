@@ -56,6 +56,8 @@ mod sampler;
 pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod progress;
 pub mod signature;
 mod switch;
 #[cfg(windows)]
