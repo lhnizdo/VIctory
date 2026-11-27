@@ -3767,6 +3767,23 @@ impl<'a> Lower<'a> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
+        if super::lds_fence() && name.starts_with("ds_") {
+            let mode = self.s.m.i32(4);
+            let void = self.s.t.void;
+            self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        }
+        if super::force_fence()
+            && (name.starts_with("buffer_") || name.starts_with("global_") || name.starts_with("flat_"))
+        {
+            let mode = self.s.m.i32(2);
+            let void = self.s.t.void;
+            self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        }
+        if super::sync_at().contains(&offset) {
+            let mode = self.s.m.i32(1 | 2 | 4);
+            let void = self.s.t.void;
+            self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        }
         self.mask_ok = match self.mask_data {
             MaskData::Console => true,
             MaskData::Host => {
@@ -3794,6 +3811,12 @@ impl<'a> Lower<'a> {
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
             Fields::Sopp { .. } if name == "s_barrier" => {
                 self.group_barrier(self.cur);
+                Ok(())
+            }
+            Fields::Sopp { .. } if name.starts_with("s_waitcnt") && super::force_fence() => {
+                let mode = self.s.m.i32(2);
+                let void = self.s.t.void;
+                self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
                 Ok(())
             }
             Fields::Sopp { .. } => Ok(()),
@@ -10622,6 +10645,9 @@ impl<'a> Lower<'a> {
         let parks_now = self.park_next.remove(&to);
         if let Some((parked, incoming, _)) = self.parked.get_mut(&to) {
             incoming.push((parks_now.unwrap_or(*parked), c));
+        }
+        if super::no_limit() {
+            return self.s.m.bool(p == pred::IULT);
         }
         self.s.m.cmp(c, p, next, limit)
     }

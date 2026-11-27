@@ -534,6 +534,7 @@ impl Shader {
     }
 
     pub fn annotate(&mut self, block: usize, h: V, props0: u32, props1: u32) -> V {
+        let props0 = if props0 & 0x1000 != 0 && super::force_coherent() { props0 | 0x4000 } else { props0 };
         let p = [self.m.i32(props0), self.m.i32(props1)];
         let p = self.m.aggregate(self.t.props, &p);
         self.op(

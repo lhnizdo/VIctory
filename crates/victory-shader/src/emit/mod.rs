@@ -304,12 +304,53 @@ pub fn loop_only() -> Option<&'static [usize]> {
     .as_deref()
 }
 
+/// `VICTORY_SHADER_SYNC_AT=<hex offsets>` (diagnostics): a group sync
+/// (with LDS and UAV fences) before each instruction at those offsets.
+pub fn sync_at() -> &'static [usize] {
+    static AT: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+    AT.get_or_init(|| {
+        let Some(v) = std::env::var("VICTORY_SHADER_SYNC_AT").ok().filter(|_| cfg!(feature = "diagnostics")) else {
+            return Vec::new();
+        };
+        v.split(',').filter_map(|o| usize::from_str_radix(o.trim().trim_start_matches("0x"), 16).ok()).collect()
+    })
+}
+
+/// `VICTORY_SHADER_NO_LIMIT=1` (diagnostics): loops have no iteration
+/// limit (its test is a constant, so no edge leaves for the abort block).
+pub fn no_limit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cfg!(feature = "diagnostics") && std::env::var("VICTORY_SHADER_NO_LIMIT").is_ok_and(|v| v == "1"))
+}
+
+/// `VICTORY_SHADER_LDS_FENCE=1` (diagnostics): a groupshared fence before
+/// every LDS instruction (the console's lanes see each other's LDS writes
+/// in instruction order).
+pub fn lds_fence() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cfg!(feature = "diagnostics") && std::env::var("VICTORY_SHADER_LDS_FENCE").is_ok_and(|v| v == "1"))
+}
+
 /// `VICTORY_SHADER_CONSOLE=1` (diagnostics): every program runs as the
 /// console runs it (`Lower::console_branches`), branches decided for the
 /// wave, to compare with its per-lane translation.
 pub fn force_console() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| cfg!(feature = "diagnostics") && std::env::var("VICTORY_SHADER_CONSOLE").is_ok_and(|v| v == "1"))
+}
+
+/// `VICTORY_SHADER_COHERENT=1` (diagnostics): every UAV handle is
+/// globally coherent (loads see other groups' stores, as `glc` does).
+pub fn force_coherent() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cfg!(feature = "diagnostics") && std::env::var("VICTORY_SHADER_COHERENT").is_ok_and(|v| v == "1"))
+}
+
+/// `VICTORY_SHADER_FENCE=1` (diagnostics): every `s_waitcnt` is a device
+/// memory fence (stores before it are seen before accesses after it).
+pub fn force_fence() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cfg!(feature = "diagnostics") && std::env::var("VICTORY_SHADER_FENCE").is_ok_and(|v| v == "1"))
 }
 
 /// The iteration limit of a loop whose header starts at byte `offset`.

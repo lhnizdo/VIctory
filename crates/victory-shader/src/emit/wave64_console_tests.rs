@@ -1656,6 +1656,10 @@ fn one_capture_replays() {
             _ => 0,
         };
     }
+    // `VICTORY_REPLAY_GROUPS`: so many groups instead (the first ones).
+    if let Some(g) = std::env::var("VICTORY_REPLAY_GROUPS").ok().and_then(|v| v.parse().ok()) {
+        groups = [g, 1, 1];
+    }
     eprintln!("replay {k}: groups {groups:?}, {} views, {} pages, user data {ud:x?}", views.len(), pages.len());
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Ok(host) = Host::new(false) else {
