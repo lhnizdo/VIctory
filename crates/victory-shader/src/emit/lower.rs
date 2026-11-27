@@ -1531,7 +1531,7 @@ impl<'a> Lower<'a> {
         // luminance histograms, shadow classification and shadow-map
         // culling among them).
         self.wave_branches = self.wave_loop_exits(&order);
-        if self.split_console {
+        if self.split_console || super::force_console() {
             self.console_mode = true;
             self.wave_branches = self.console_branches(&order);
             self.park_lanes(&order);

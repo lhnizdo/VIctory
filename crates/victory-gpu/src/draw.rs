@@ -1448,6 +1448,26 @@ impl State {
     /// program dropped (`VICTORY_BUILDER_DROP`), they are what it would read.
     #[cfg(feature = "diagnostics")]
     fn capture_inputs(&self, list: &HostList, groups: [u32; 3]) {
+        // `VICTORY_BUILDER_STOP_AT=<hash>:<groups>`: the frame's builder
+        // stops after the first such dispatch (it runs or is dropped as
+        // asked), so its inputs stay as they were until the list has run.
+        static STOP_AT: std::sync::OnceLock<Option<(String, u32)>> = std::sync::OnceLock::new();
+        let stop_at = STOP_AT.get_or_init(|| {
+            let v = std::env::var("VICTORY_BUILDER_STOP_AT").ok()?;
+            let (h, g) = v.split_once(':')?;
+            Some((h.to_owned(), g.parse().ok()?))
+        });
+        let shaders = crate::pipeline::shaders_of(self.pipeline as This);
+        if let Some((h, g)) = stop_at
+            && shaders.contains(h.as_str())
+            && *g == groups[0] * groups[1] * groups[2]
+        {
+            static STOPPED_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !STOPPED_ONCE.swap(true, Ordering::Relaxed) {
+                tracing::warn!(frame = crate::frame::current(), "builder stopped at {h}:{g}");
+                crate::pipeline::stop_builder_this_frame();
+            }
+        }
         static WANT: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
         static TAKEN: AtomicU64 = AtomicU64::new(0);
         let (want, dir) = WANT.get_or_init(|| {
@@ -1456,7 +1476,8 @@ impl State {
                 std::env::var("VICTORY_BUILDER_CAPTURE_DIR").unwrap_or_default(),
             )
         });
-        if want.is_empty() || dir.is_empty() || !crate::pipeline::shaders_of(self.pipeline as This).contains(want.as_str()) {
+        let any = want == "all" && crate::pipeline::is_builder(self.pipeline as This);
+        if want.is_empty() || dir.is_empty() || !(any || shaders.contains(want.as_str())) {
             return;
         }
         // `VICTORY_BUILDER_CAPTURE_MIN_GROUPS`: only dispatches that big.
@@ -1492,25 +1513,38 @@ impl State {
         let frame = crate::frame::current();
         let mut meta = format!("frame {frame}
 groups {} {} {}
+program {shaders}
 ", groups[0], groups[1], groups[2]);
         let mut views = Vec::new();
         for (slot, root) in self.roots_ref(true).iter().enumerate() {
             match root {
                 Root::View(a) => {
-                    meta.push_str(&format!("view {slot} {a:#x}
-"));
+                    meta.push_str(&format!("view {slot} {a:#x}\n"));
                     views.push((slot, *a));
                 }
-                Root::Constants(c) => meta.push_str(&format!("constants {slot} {c:x?}
-")),
-                Root::Table(t) => meta.push_str(&format!("table {slot} {t:#x}
-")),
+                Root::Constants(c) => {
+                    meta.push_str(&format!("constants {slot} {c:x?}\n"));
+                    // Title addresses among the constants (a header the
+                    // program reads through them): captured too, from 100.
+                    for (i, w) in c.windows(2).enumerate() {
+                        let a = u64::from(w[0]) | u64::from(w[1]) << 32;
+                        if (1..=0xFF).contains(&w[1]) && crate::shadow::find(a, 4).is_some() {
+                            let extra = 100 + 16 * slot + i;
+                            meta.push_str(&format!("view {extra} {a:#x}\n"));
+                            views.push((extra, a));
+                        }
+                    }
+                }
+                Root::Table(t) => meta.push_str(&format!("table {slot} {t:#x}\n")),
                 Root::None => {}
             }
         }
         let dir = std::path::PathBuf::from(dir);
         let _ = std::fs::create_dir_all(&dir);
         let _ = std::fs::write(dir.join(format!("{k}.txt")), &meta);
+        if std::env::var("VICTORY_BUILDER_CAPTURE_BYTES").is_ok_and(|v| v == "0") {
+            return;
+        }
         let done = std::sync::atomic::AtomicBool::new(false);
         list.defer_after(move || {
             if done.swap(true, Ordering::Relaxed) {

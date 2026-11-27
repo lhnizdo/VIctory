@@ -304,6 +304,14 @@ pub fn loop_only() -> Option<&'static [usize]> {
     .as_deref()
 }
 
+/// `VICTORY_SHADER_CONSOLE=1` (diagnostics): every program runs as the
+/// console runs it (`Lower::console_branches`), branches decided for the
+/// wave, to compare with its per-lane translation.
+pub fn force_console() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cfg!(feature = "diagnostics") && std::env::var("VICTORY_SHADER_CONSOLE").is_ok_and(|v| v == "1"))
+}
+
 /// The iteration limit of a loop whose header starts at byte `offset`.
 pub(crate) fn loop_limit_at(offset: usize) -> u32 {
     match loop_only() {
