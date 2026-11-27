@@ -81,4 +81,34 @@ impl Lower<'_> {
         let differ = self.s.m.cmp(c, pred::NE, n, f);
         Some(self.s.m.bin(c, Bin::Or, differ, first))
     }
+
+    /// Sets bit `n` of the mark bitmap `bitmap` (a title-memory write or
+    /// miss): only the lane [`Lower::mark_lead`] picks for that bit, and
+    /// only when a load finds it clear. Within a submission bits only go
+    /// from 0 to 1, so a stale 0 costs at most a second atomic. The bitmap
+    /// is in system memory; per lane, each store of a compute pass that
+    /// writes title memory was an atomic across the bus.
+    pub(super) fn mark_once(&mut self, bitmap: V, n: V) {
+        let c = self.cur;
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let (k5, k31, k2, one, zero) = (k(self, 5), k(self, 31), k(self, 2), k(self, 1), k(self, 0));
+        // Byte offset of the bitmap dword.
+        let word = self.s.m.bin(c, Bin::LShr, n, k5);
+        let word = self.s.m.bin(c, Bin::Shl, word, k2);
+        let bit = self.s.m.bin(c, Bin::And, n, k31);
+        let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+        let lead = self.mark_lead(n);
+        let led = self.begin_guarded(lead);
+        let c = self.cur;
+        let old = self.raw_dword(bitmap, word);
+        let set = self.s.m.bin(c, Bin::And, old, bit);
+        let clear = self.s.m.cmp(c, pred::EQ, set, zero);
+        let inner = self.begin_guarded(Some(clear));
+        let iu = self.s.m.undef(self.s.t.i32);
+        // Operation 2 is OR.
+        self.s
+            .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
+        self.end_guarded(inner, &[]);
+        self.end_guarded(led, &[]);
+    }
 }
