@@ -69,8 +69,8 @@ fn build() -> &'static [u8; 32] {
         // translation of its own.
         let limit = match victory_shader::emit::loop_only() {
             Some(only) => {
-                tracing::warn!(only = format_args!("{only:#x}"), limit, "VICTORY_SHADER_LOOP_ONLY: only that loop is limited");
-                limit ^ ((only as u32) << 8 | 0x8000_0000)
+                tracing::warn!(only = format_args!("{only:x?}"), limit, "VICTORY_SHADER_LOOP_ONLY: only those loops are limited");
+                only.iter().fold(limit ^ 0x8000_0000, |k, &o| k.rotate_left(7) ^ o as u32)
             }
             None => limit,
         };
