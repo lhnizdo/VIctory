@@ -291,6 +291,25 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// `VICTORY_SHADER_LOOP_ONLY=<hex offset>` (diagnostics): the loop limit
+/// applies only to loops whose header starts at that byte offset; every
+/// other loop keeps the default. Finds which loop of a program runs on.
+pub fn loop_only() -> Option<usize> {
+    static ONLY: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *ONLY.get_or_init(|| {
+        let v = std::env::var("VICTORY_SHADER_LOOP_ONLY").ok().filter(|_| cfg!(feature = "diagnostics"))?;
+        usize::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()
+    })
+}
+
+/// The iteration limit of a loop whose header starts at byte `offset`.
+pub(crate) fn loop_limit_at(offset: usize) -> u32 {
+    match loop_only() {
+        Some(only) if only != offset => lower::LOOP_LIMIT,
+        _ => loop_limit(),
+    }
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {

@@ -10599,7 +10599,7 @@ impl<'a> Lower<'a> {
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
-        let limit = self.s.m.i32(super::loop_limit());
+        let limit = self.s.m.i32(super::loop_limit_at(self.x.p.blocks[to].offset));
         self.counters
             .get_mut(&to)
             .expect("header")

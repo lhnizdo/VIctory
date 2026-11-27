@@ -65,6 +65,15 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
+        // A limit for one loop only (`VICTORY_SHADER_LOOP_ONLY`) is a
+        // translation of its own.
+        let limit = match victory_shader::emit::loop_only() {
+            Some(only) => {
+                tracing::warn!(only = format_args!("{only:#x}"), limit, "VICTORY_SHADER_LOOP_ONLY: only that loop is limited");
+                limit ^ ((only as u32) << 8 | 0x8000_0000)
+            }
+            None => limit,
+        };
         crate::descriptor::host::probe_view_limit();
         key(victory_shader::SOURCE_HASH, ENCODING, limit, victory_shader::emit::view_heap_limit())
     })
