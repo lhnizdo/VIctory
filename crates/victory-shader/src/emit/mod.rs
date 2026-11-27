@@ -331,6 +331,30 @@ pub fn lds_fence() -> bool {
     *ON.get_or_init(|| cfg!(feature = "diagnostics") && std::env::var("VICTORY_SHADER_LDS_FENCE").is_ok_and(|v| v == "1"))
 }
 
+/// `VICTORY_SHADER_PROBE=<hex title address>@<hex offsets>` (diagnostics):
+/// before each instruction at those offsets, every lane that runs it
+/// appends a record of 8 dwords (offset, lane, then up to three (register,
+/// value) pairs the instruction reads) after a counter at the address.
+pub fn probe() -> Option<&'static (u64, Vec<usize>)> {
+    static P: std::sync::OnceLock<Option<(u64, Vec<usize>)>> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        let v = std::env::var("VICTORY_SHADER_PROBE").ok().filter(|_| cfg!(feature = "diagnostics"))?;
+        let (a, offs) = v.split_once('@')?;
+        let a = u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()?;
+        let offs = offs.split(',').filter_map(|o| usize::from_str_radix(o.trim().trim_start_matches("0x"), 16).ok()).collect();
+        Some((a, offs))
+    })
+    .as_ref()
+}
+
+/// `VICTORY_SHADER_LOAD_UAV=1` (diagnostics): title memory is read through
+/// its page's UAV too, not its raw SRV (which need not see this dispatch's
+/// writes).
+pub fn load_uav() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cfg!(feature = "diagnostics") && std::env::var("VICTORY_SHADER_LOAD_UAV").is_ok_and(|v| v == "1"))
+}
+
 /// `VICTORY_SHADER_CONSOLE=1` (diagnostics): every program runs as the
 /// console runs it (`Lower::console_branches`), branches decided for the
 /// wave, to compare with its per-lane translation.

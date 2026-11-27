@@ -1739,3 +1739,18 @@ fn one_capture_replays() {
         Err(e) => panic!("replay {k}: failed after {:?}: {e}", started.elapsed()),
     }
 }
+
+/// Writes the native code of `VICTORY_NATIVE_CONTAINER`'s program to
+/// `VICTORY_NATIVE_OUT` (local, for the reference interpreter).
+#[test]
+fn one_container_native_written() {
+    let (Some(path), Some(out)) = (std::env::var_os("VICTORY_NATIVE_CONTAINER"), std::env::var_os("VICTORY_NATIVE_OUT"))
+    else {
+        return;
+    };
+    let bytes = std::fs::read(path).expect("container");
+    let c = crate::dxbc::Container::parse(&bytes).expect("container");
+    let dxil = c.part(crate::dxbc::FourCC::DXIL).expect("DXIL part");
+    let native = crate::native_programs(dxil.data).expect("native").into_iter().next().expect("a program");
+    std::fs::write(out, &native.code).expect("written");
+}

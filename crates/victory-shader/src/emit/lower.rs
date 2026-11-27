@@ -368,6 +368,11 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
+    /// The program stores to memory: it reads title memory through the
+    /// UAVs it writes, and `glc` accesses are coherent ([`Lower::memory`]).
+    writes_memory: bool,
+    /// The instruction being lowered has `glc`.
+    glc: bool,
     /// [`Lowered::heap`], [`Lowered::heap_writes`].
     heap: [bool; 2],
     /// src0 of the current instruction as DPP fetched it.
@@ -720,6 +725,10 @@ impl<'a> Lower<'a> {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
+        let writes_memory = insts().any(|i| {
+            matches!(i.fields, Fields::Buffer { .. } | Fields::Flat { .. })
+                && (i.name().contains("store") || i.name().contains("atomic"))
+        });
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
@@ -866,6 +875,8 @@ impl<'a> Lower<'a> {
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
+            writes_memory,
+            glc: false,
             heap: [false; 2],
             src0: None,
             exec_lanes: None,
@@ -3767,6 +3778,12 @@ impl<'a> Lower<'a> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
+        self.glc = match &inst.fields {
+            Fields::Smem { cache, .. } | Fields::Buffer { cache, .. } | Fields::Flat { cache, .. } => {
+                cache.glc
+            }
+            _ => false,
+        };
         if super::lds_fence() && name.starts_with("ds_") {
             let mode = self.s.m.i32(4);
             let void = self.s.t.void;
@@ -3778,6 +3795,11 @@ impl<'a> Lower<'a> {
             let mode = self.s.m.i32(2);
             let void = self.s.t.void;
             self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        }
+        if let Some((base, offs)) = super::probe()
+            && offs.contains(&offset)
+        {
+            self.probe(inst, b, i, *base, offset);
         }
         if super::sync_at().contains(&offset) {
             let mode = self.s.m.i32(1 | 2 | 4);
@@ -3841,6 +3863,59 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
         }
+    }
+
+    /// [`super::probe`]: this lane's record of what `inst` reads.
+    fn probe(&mut self, inst: &Inst, b: usize, i: usize, base: u64, offset: usize) {
+        let Ok(guard) = self.guard(b, i) else { return };
+        let mut vals = Vec::new();
+        for &(reg, v) in &inst.reads {
+            if vals.len() == 3 {
+                break;
+            }
+            let id = match reg {
+                Reg::V(n) => 0x100 + u32::from(n),
+                Reg::S(n) => u32::from(n),
+                _ => continue,
+            };
+            if let Ok(x) = self.i32_of(v) {
+                vals.push((id, x));
+            }
+        }
+        let at = self.begin_guarded(guard);
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let (lo, hi) = (k(self, base as u32), k(self, (base >> 32) as u32));
+        let (h, off) = self.memory(lo, hi, 4, true, None);
+        let c = self.cur;
+        let (iu, i32t, void) = (self.s.m.undef(self.s.t.i32), self.s.t.i32, self.s.t.void);
+        let (add, one) = (k(self, 0), k(self, 1));
+        let slot = self.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, add, off, iu, iu, one]);
+        let (k5, k64) = (k(self, 5), k(self, 64));
+        let rel = self.s.m.bin(c, Bin::Shl, slot, k5);
+        let rel = self.s.m.bin(c, Bin::Add, rel, k64);
+        let rlo = self.s.m.bin(c, Bin::Add, lo, rel);
+        let (h2, off2) = self.memory(rlo, hi, 32, true, None);
+        let c = self.cur;
+        let lane = self.lane_index();
+        let mut words = vec![k(self, offset as u32), lane];
+        for &(id, x) in &vals {
+            words.push(k(self, id));
+            words.push(x);
+        }
+        let none = k(self, 0xFFFF);
+        while words.len() < 8 {
+            words.push(none);
+        }
+        for half in 0..2 {
+            let o = k(self, 16 * half as u32);
+            let at2 = self.s.m.bin(c, Bin::Add, off2, o);
+            let mut args = vec![h2, at2, iu];
+            args.extend(&words[4 * half..4 * half + 4]);
+            args.push(self.s.m.i8(0xF));
+            args.push(k(self, 4));
+            self.s.op(c, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+        }
+        self.end_guarded(at, &[]);
     }
 
     fn is_mask(&self, v: Option<Value>) -> bool {
@@ -5049,9 +5124,14 @@ impl<'a> Lower<'a> {
         let null = self.raw_dword(map, first);
         let miss = self.s.m.cmp(c, pred::EQ, view, null);
         // Views come in pairs: the raw SRV, then the raw UAV of one copy.
-        let (view, props) = if write {
+        // A program that stores reads through the UAV too: a read through
+        // the SRV need not see this dispatch's writes (NVIDIA may read it as
+        // unchanging). A `glc` access is globally coherent, as the console's
+        // passes the compute unit's cache: it sees other groups' writes.
+        let (view, props) = if write || self.writes_memory {
             let one = k(self, 1);
-            (self.s.m.bin(c, Bin::Add, view, one), (11 | 0x1000, 0))
+            let coherent = if self.glc { 0x4000 } else { 0 };
+            (self.s.m.bin(c, Bin::Add, view, one), (11 | 0x1000 | coherent, 0))
         } else {
             (view, (11, 0))
         };
