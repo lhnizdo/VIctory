@@ -230,13 +230,47 @@ impl<'a> Lower<'a> {
                     && matches!(self.x.st.exits[l], LaneExit::Branch { taken, not_taken, .. }
                         if (taken == h && !body[not_taken]) || (not_taken == h && !body[taken]))
             });
-            if !parks {
+            // The console compiler's form: the decided branch goes round
+            // through a block that only jumps back (`s_and_b64 exec, ...`),
+            // its other side leaving the loop.
+            let via: Vec<usize> = latches
+                .iter()
+                .copied()
+                .filter(|&l| {
+                    matches!(self.x.st.exits[l], LaneExit::Jump(t) if t == h)
+                        && matches!(self.x.p.blocks[l].preds[..], [x] if self.wave_branches.contains_key(&x)
+                            && matches!(self.x.st.exits[x], LaneExit::Branch { taken, not_taken, .. }
+                                if (taken == l && !body[not_taken]) || (not_taken == l && !body[taken])))
+                })
+                .collect();
+            if !parks && via.is_empty() {
                 continue;
+            }
+            for l in via {
+                self.park_via.insert(l, h);
             }
             let blk = self.block[h].expect("reachable");
             let phi = self.s.m.phi(blk, self.s.t.i1);
             self.parked.insert(h, (phi, Vec::new(), body));
         }
+    }
+
+    /// The parked flag a lane enters a parked loop with from IR block
+    /// `from`: set unless the lane comes on its own path (what holds in
+    /// lanes reaching `from`, and `takes`, its own side of a branch the wave
+    /// decided). A lane the wave carries in runs nothing in the loop.
+    pub(super) fn parked_at_entry(&mut self, from: usize, takes: Option<V>) -> V {
+        let reach = self.x.st.reach[from];
+        let Ok(on) = self.boolean(reach, self.cur) else {
+            return self.s.m.bool(false);
+        };
+        let c = self.cur;
+        let on = match takes {
+            Some(t) => self.s.m.bin(c, Bin::And, on, t),
+            None => on,
+        };
+        let yes = self.s.m.bool(true);
+        self.s.m.bin(c, Bin::Xor, on, yes)
     }
 
     /// `guard` with the lanes parked in every loop holding block `b` left

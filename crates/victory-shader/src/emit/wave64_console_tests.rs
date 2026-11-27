@@ -200,7 +200,7 @@ fn runs_as_the_console(name: &str, words: &[u32], want: impl Fn(u32) -> u32) {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let mut ran = 0;
+    let (mut ran, mut failed) = (0, Vec::new());
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
@@ -220,10 +220,13 @@ fn runs_as_the_console(name: &str, words: &[u32], want: impl Fn(u32) -> u32) {
                 },
             )
             .unwrap_or_else(|e| panic!("{name}, {label}: dispatch failed (a hang?): {e}"));
-        assert_eq!(out[0][..THREADS as usize], want[..], "{name}, {label}");
+        if out[0][..THREADS as usize] != want[..] {
+            failed.push(format!("{name}, {label}: {:?}", &out[0][..THREADS as usize]));
+        }
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    assert!(failed.is_empty(), "want {want:?}; {failed:#?}");
 }
 
 /// The programs decode to the instructions they are meant to be.
@@ -1403,4 +1406,88 @@ fn one_container_dxil_written() {
     // As the game makes it (`shader_cache`).
     let shader = super::translate_with(&bytes, super::Options { view_marks: true }).expect("translates");
     std::fs::write(out, &shader.dxil).expect("written");
+}
+
+/// The console BVH builder's equality-exit waterfall (`28918b71`'s loops at
+/// 0x2e0 and 0x798): each lane's count is `t >> 4` (0 for threads 0-15,
+/// 1, 2, 3 for the others, so the halves' largest differ); lanes with 0
+/// stay out (`v_cmpx_eq_u32 exec, 0, v9`, then `s_andn2_b64 exec`); the
+/// loop counts s20 up and drops a lane when s20 equals its count, until
+/// none is left (`s_andn2_b64 s[16:17], s[16:17], exec`, then SCC). Each
+/// pass adds 1 to v1: a lane stores its count. With `clobber`, the body
+/// saves EXEC in s[18:19], restores it, then uses s18 as a scalar
+/// (`s_mul_i32 s18, s20, 6`) before saving EXEC there again, as 0x2e0 does.
+fn equality_exit_waterfall(clobber: bool) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x2C12_0084, // v_lshrrev_b32 v9, 4, v0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xBE8C_047E, // s_mov_b64 s[12:13], exec
+        0x7DA4_1280, // v_cmpx_eq_u32 exec, 0, v9
+        0x8AFE_7E0C, // s_andn2_b64 exec, s[12:13], exec
+    ]);
+    let body: Vec<u32> = if clobber {
+        vec![
+            0xBE92_047E, // s_mov_b64 s[18:19], exec
+            0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+            0xBEFE_0412, // s_mov_b64 exec, s[18:19]
+            0x9312_8614, // s_mul_i32 s18, s20, 6
+            0x8114_8114, // s_add_i32 s20, s20, 1
+        ]
+    } else {
+        vec![
+            0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+            0x8114_8114, // s_add_i32 s20, s20, 1
+        ]
+    };
+    let tail = [
+        0xBE92_047E, // s_mov_b64 s[18:19], exec
+        0x7DA4_1214, // v_cmpx_eq_u32 exec, s20, v9
+        0xBF80_0000, // s_nop 0
+        0x8A90_7E10, // s_andn2_b64 s[16:17], s[16:17], exec
+    ];
+    // Word indices from the s_cbranch_execz: execz(0) s16(1) s20(2)
+    // branch(3) top: and(4) nop(5) body(6..) tail, scc1, restore.
+    let n = body.len() as u32 + tail.len() as u32;
+    let scc1 = 6 + n;
+    let restore = scc1 + 1;
+    w.push(0xBF88_0000 | (restore - 1)); // s_cbranch_execz restore
+    w.extend([
+        0xBE90_047E, // s_mov_b64 s[16:17], exec
+        0xBE94_0380, // s_mov_b32 s20, 0
+        0xBF82_0002, // s_branch body
+        0x87FE_1012, // top: s_and_b64 exec, s[18:19], s[16:17]
+        0xBF80_0000, // s_nop 0
+    ]);
+    w.extend(body);
+    w.extend(tail);
+    let back = 4i32 - (scc1 as i32 + 1);
+    w.push(0xBF85_0000 | (back as u32 & 0xFFFF)); // s_cbranch_scc1 top
+    w.push(0xBEFE_040C); // restore: s_mov_b64 exec, s[12:13]
+    w.extend_from_slice(EPILOGUE);
+    w
+}
+
+#[test]
+fn an_equality_exit_waterfall_leaves_when_its_lanes_are_done() {
+    runs_as_the_console("waterfall", &equality_exit_waterfall(false), |t| t >> 4);
+}
+
+#[test]
+fn an_equality_exit_waterfall_with_its_saved_exec_reused_leaves_too() {
+    runs_as_the_console("waterfall, s18 reused", &equality_exit_waterfall(true), |t| t >> 4);
+}
+
+#[test]
+fn equality_exit_waterfall_decodes() {
+    let code: Vec<u8> = equality_exit_waterfall(false).iter().flat_map(|w| w.to_le_bytes()).collect();
+    for i in crate::gfx10::decode(&code).expect("decode") {
+        eprintln!("{:?}", i.name());
+    }
+}
+
+#[test]
+fn equality_exit_waterfall_dxil_written() {
+    let Some(out) = std::env::var_os("VICTORY_WATERFALL_DXIL") else { return };
+    std::fs::write(out, lowered(&equality_exit_waterfall(false)).dxil).expect("written");
 }

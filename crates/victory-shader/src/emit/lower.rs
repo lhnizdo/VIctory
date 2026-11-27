@@ -355,6 +355,11 @@ struct Lower<'a> {
     /// header's phi, its incoming (value, DXIL block) pairs, and the loop's
     /// last block in RPO ([`Lower::park_lanes`]).
     parked: HashMap<usize, Parked>,
+    /// Blocks that only jump to a parked loop's header (the console's
+    /// `s_and_b64 exec` before it), by block: the header; and what the
+    /// decided branch before one parks, by header, for its back edge.
+    park_via: HashMap<usize, usize>,
+    park_next: HashMap<usize, V>,
     /// Per IR block: a `done` export is behind every lane entering it.
     exported: Vec<bool>,
     /// Reverse-postorder index per IR block.
@@ -855,6 +860,8 @@ impl<'a> Lower<'a> {
             wave_branches: HashMap::new(),
             console_mode: false,
             parked: HashMap::new(),
+            park_via: HashMap::new(),
+            park_next: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
@@ -10415,7 +10422,7 @@ impl<'a> Lower<'a> {
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
             LaneExit::Jump(t) => {
-                self.enter_loop(b, t, self.cur);
+                self.enter_loop(b, t, self.cur, None);
                 Term::Br(self.block[t].expect("reachable"))
             }
             LaneExit::Branch {
@@ -10483,13 +10490,14 @@ impl<'a> Lower<'a> {
                 };
                 // A latch whose other side leaves the loop: lanes that would have
                 // left while the wave goes round are parked (`Lower::parked`).
+                // Round through a block that only jumps back (`park_via`).
                 let latch = [(taken, not_taken, false), (not_taken, taken, true)]
                     .into_iter()
-                    .find(|&(round, out, _)| {
-                        back(self, round)
-                            && self.parked.get(&round).is_some_and(|p| !p.2[out])
+                    .find_map(|(round, out, t)| {
+                        let h = if back(self, round) { round } else { *self.park_via.get(&round)? };
+                        self.parked.get(&h).is_some_and(|p| !p.2[out]).then_some((h, round, t))
                     });
-                if let Some((header, _, leaves_when_taken)) = latch {
+                if let Some((header, round, leaves_when_taken)) = latch {
                     let c = self.cur;
                     let leaves = if leaves_when_taken {
                         lane
@@ -10499,15 +10507,19 @@ impl<'a> Lower<'a> {
                     };
                     let phi = self.parked[&header].0;
                     let now = self.s.m.bin(c, Bin::Or, phi, leaves);
-                    if let Some(last) = self.parked.get_mut(&header).and_then(|p| p.1.last_mut()) {
+                    if round != header {
+                        self.park_next.insert(header, now);
+                    } else if let Some(last) = self.parked.get_mut(&header).and_then(|p| p.1.last_mut()) {
                         *last = (now, c);
                     }
                 }
                 let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
-                for (to, via) in [(taken, t), (not_taken, f)] {
+                let yes = self.s.m.bool(true);
+                let not_lane = self.s.m.bin(self.cur, Bin::Xor, lane, yes);
+                for (to, via, takes) in [(taken, t, lane), (not_taken, f, not_lane)] {
                     if !back(self, to) {
                         let from = if Some(via) == self.block[to] { self.cur } else { via };
-                        self.enter_loop(b, to, from);
+                        self.enter_loop(b, to, from, Some(takes));
                     }
                 }
                 Term::CondBr(cond, t, f)
@@ -10557,7 +10569,7 @@ impl<'a> Lower<'a> {
                         } else {
                             via
                         };
-                        self.enter_loop(b, to, from);
+                        self.enter_loop(b, to, from, None);
                     }
                 }
                 Term::CondBr(cond, t, f)
@@ -10580,14 +10592,14 @@ impl<'a> Lower<'a> {
 
     /// A forward edge into loop header `to` (from DXIL block `via`) starts
     /// its count at 0.
-    fn enter_loop(&mut self, _from: usize, to: usize, via: usize) {
+    fn enter_loop(&mut self, from: usize, to: usize, via: usize, takes: Option<V>) {
         if let Some((_, incoming)) = self.counters.get_mut(&to) {
             let z = self.s.m.i32(0);
             incoming.push((z, via));
         }
-        if let Some((_, incoming, _)) = self.parked.get_mut(&to) {
-            let no = self.s.m.bool(false);
-            incoming.push((no, via));
+        if self.parked.contains_key(&to) {
+            let start = self.parked_at_entry(from, takes);
+            self.parked.get_mut(&to).expect("parked").1.push((start, via));
         }
     }
 
@@ -10607,9 +10619,9 @@ impl<'a> Lower<'a> {
             .push((next, c));
         // Parked lanes stay parked round the loop (`Lower::wave_branch`
         // may park more).
+        let parks_now = self.park_next.remove(&to);
         if let Some((parked, incoming, _)) = self.parked.get_mut(&to) {
-            let parked = *parked;
-            incoming.push((parked, c));
+            incoming.push((parks_now.unwrap_or(*parked), c));
         }
         self.s.m.cmp(c, p, next, limit)
     }
