@@ -925,6 +925,36 @@ pub(crate) fn dred_on() -> bool {
     *ON.get_or_init(|| cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DRED"))
 }
 
+/// How many of a slow list's slowest commands and programs are logged
+/// (`VICTORY_SLOW_COMMANDS`, default 6; diagnostics).
+#[cfg(feature = "diagnostics")]
+fn slow_commands() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_SLOW_COMMANDS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(6)
+    })
+}
+
+/// A list's command times summed by the shader they name (the first
+/// `[stage hash` in the text, else the op's first word), longest first, as
+/// (milliseconds, commands, name).
+#[cfg(feature = "diagnostics")]
+fn by_program(times: &[(f64, String)]) -> Vec<(f64, usize, String)> {
+    let mut sums: std::collections::HashMap<String, (f64, usize)> = std::collections::HashMap::new();
+    for (ms, op) in times {
+        let name = match op.find('[') {
+            Some(at) => op[at + 1..].split([',', ']']).next().unwrap_or("").to_owned(),
+            None => op.split_whitespace().next().unwrap_or("").to_owned(),
+        };
+        let e = sums.entry(name).or_default();
+        e.0 += ms;
+        e.1 += 1;
+    }
+    let mut out: Vec<(f64, usize, String)> = sums.into_iter().map(|(k, (ms, n))| (ms, n, k)).collect();
+    out.sort_by(|a, b| b.0.total_cmp(&a.0));
+    out
+}
+
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
 /// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
@@ -1353,8 +1383,12 @@ impl Host {
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
                 tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6) {
+                let all = runs[i].slowest(frequency, usize::MAX);
+                for (ms, op) in all.iter().take(slow_commands()) {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                }
+                for (ms, n, program) in by_program(&all).into_iter().take(slow_commands()) {
+                    tracing::warn!("slow list program, {ms:.1} ms in {n} commands: {program}");
                 }
             }
             // SAFETY: a plain query.
@@ -3957,10 +3991,29 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
         .position(barrier)
         .map_or(history.len(), |b| (done + b).max(done + 1));
     let mut text = format!(", commands {from}..{to} between its barriers:");
+    commands(&mut text, history, markers, from..to);
+    // A barrier counts as done once the GPU front end reaches it; the work
+    // before it may still be running (diagnostics: shown too).
+    if cfg!(feature = "diagnostics") && from > 0 {
+        let before = history[..from - 1].iter().rposition(barrier).map_or(0, |b| b + 1);
+        text.push_str(&format!("; before that barrier, commands {before}..{}:", from - 1));
+        commands(&mut text, history, markers, before..from - 1);
+    }
+    text
+}
+
+/// [`in_flight`]'s list of the commands in `range` (up to 24, markers
+/// skipped) with what their markers say.
+fn commands(
+    text: &mut String,
+    history: &[D3D12_AUTO_BREADCRUMB_OP],
+    markers: &[(u32, String)],
+    range: std::ops::Range<usize>,
+) {
     let mut shown = 0;
-    for i in from..to {
+    for i in range {
         let op = history[i];
-        if op == D3D12_AUTO_BREADCRUMB_OP_SETMARKER || shown == 12 {
+        if op == D3D12_AUTO_BREADCRUMB_OP_SETMARKER || shown == 24 {
             continue;
         }
         shown += 1;
@@ -3971,7 +4024,6 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
             .map_or("no marker", |(_, s)| s.as_str());
         text.push_str(&format!("; command {i} (op {}): {marker}", op.0));
     }
-    text
 }
 
 pub(crate) fn transition(

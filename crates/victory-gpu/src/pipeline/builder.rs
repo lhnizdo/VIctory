@@ -109,6 +109,29 @@ pub(crate) fn dropped_by_env(shaders: &str) -> bool {
     !want.is_empty() && want.iter().any(|h| shaders.contains(h.as_str()))
 }
 
+/// Local diagnostics, `VICTORY_BUILDER_UPTO=<n>`: only the builder's first
+/// `n` dispatches of a frame run, the rest are dropped. A list cut short
+/// finishes, so its per-command times (`VICTORY_GPU_TIMING` with
+/// `VICTORY_D3D12_DRED`) show where the
+/// builder's time goes before the driver resets a list that runs too long.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn past_limit() -> bool {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    static SEEN: Mutex<(u64, u64)> = Mutex::new((u64::MAX, 0));
+    let Some(limit) = *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_BUILDER_UPTO").ok().and_then(|v| v.trim().parse().ok())
+    }) else {
+        return false;
+    };
+    let frame = crate::frame::current();
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.0 != frame {
+        *seen = (frame, 0);
+    }
+    seen.1 += 1;
+    seen.1 > limit
+}
+
 /// The frame [`runs`] last decided for, and its decision.
 static DECIDED: Mutex<(u64, bool)> = Mutex::new((u64::MAX, true));
 

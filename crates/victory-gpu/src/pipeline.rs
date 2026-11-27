@@ -284,6 +284,10 @@ pub(crate) fn held_back(this: This) -> bool {
     if builder::dropped_by_env(&shaders_of(this)) {
         return true;
     }
+    #[cfg(feature = "diagnostics")]
+    if builder::runs() && builder::past_limit() {
+        return true;
+    }
     !builder::runs()
 }
 
