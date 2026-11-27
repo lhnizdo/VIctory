@@ -1457,16 +1457,23 @@ impl State {
                 tracing::info!(k, n, "tree check: no host copy of the parents or children");
                 return;
             };
+            // The root is node 0 (the refit leaves its loop there), whatever
+            // its parent slot holds.
             let (mut roots_seen, mut out_of_range, mut cycles, mut first_cycle) = (0, 0, 0, None);
+            let mut deepest = 0;
             for start in 0..nodes {
                 let mut v = start;
                 let mut steps = 0;
                 loop {
-                    let p = up[v];
-                    if p == u32::MAX {
-                        if steps == 0 {
+                    if v == 0 {
+                        if start == 0 {
                             roots_seen += 1;
                         }
+                        deepest = deepest.max(steps);
+                        break;
+                    }
+                    let p = up[v];
+                    if p == u32::MAX {
                         break;
                     }
                     if p as usize >= n - 1 {
@@ -1493,6 +1500,8 @@ impl State {
                 cycles,
                 first_cycle = ?first_cycle,
                 children_not_pointing_back = back,
+                parent_zero = (1..nodes).filter(|&v| up[v] == 0).count(),
+                deepest,
                 parent_head = ?&up[..up.len().min(8)],
                 "tree check"
             );
